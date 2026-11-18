@@ -2775,5 +2775,7 @@ function initFileDenoiseUI() {
 }
 
 function keyPressed() {
+  const ae = document.activeElement, tag = ae ? ae.tagName : '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') { return; }   // 数字入力中はページ切替をしない
   if (key >= '1' && key <= '5') { setPage(PAGES[Number(key) - 1][0]); }
 }
