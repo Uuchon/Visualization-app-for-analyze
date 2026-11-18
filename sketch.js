@@ -1440,8 +1440,18 @@ function seekToMouse(strict) {
   if (fp.playing) fpStart(pos); else fp.offset = pos;
   return true;
 }
-function mousePressed() { seeking = seekToMouse(true); }
-function mouseReleased() { if (seeking) { seekToMouse(false); seeking = false; } }
+function tcTime() { return TC.t0 + constrain((mouseX - TC.x) / TC.w, 0, 1) * (TC.t1 - TC.t0); }
+function mousePressed() {
+  if (page === 'report' && TC.w > 0 && mouseX >= TC.x && mouseX <= TC.x + TC.w && mouseY >= TC.y - 4 && mouseY <= TC.y + TC.h) {
+    TC.drag = true; TC.anchor = TC.cur = tcTime(); return;
+  }
+  seeking = seekToMouse(true);
+}
+function mouseDragged() { if (TC.drag) { TC.cur = tcTime(); } }
+function mouseReleased() {
+  if (TC.drag) { TC.drag = false; TC.cur = tcTime(); if (Math.abs(TC.cur - TC.anchor) > 0.2) { setRange(TC.anchor, TC.cur); } return; }
+  if (seeking) { seekToMouse(false); seeking = false; }
+}
 
 // ================= 13) 記録・数値化・レポート =================
 // 音を再生/入力している間、約50msごとに数値と色を記録し、
@@ -1455,6 +1465,40 @@ let reportSnap = false;
 const reportButtons = [];
 const LOG = { rec: [], interval: 0.05, last: -1, t0: null, max: 20000, avg: null, avgN: 0 };
 const GRAY_RGB = [230, 235, 240];
+
+// ---- 保存・集計する範囲（記録の時間軸[秒]で指定。null=全体） ----
+// 録音の最初や最後に入る雑音を除くため、時系列CSV・スペクトルCSV・グラフの集計をこの範囲だけに絞れる。
+const RANGE = { a: null, b: null };
+const TC = { x: 0, y: 0, w: 0, h: 0, t0: 0, t1: 1, drag: false, anchor: 0, cur: 0 };
+let avgCache = null;
+function rangeOn() { return RANGE.a !== null && RANGE.b !== null && RANGE.b > RANGE.a; }
+function inRange(t) { return !rangeOn() || (t >= RANGE.a && t <= RANGE.b); }
+function setRange(a, b) {
+  if (a === null || b === null || !(Math.abs(b - a) > 0.05)) { RANGE.a = RANGE.b = null; }
+  else { RANGE.a = Math.max(0, Math.min(a, b)); RANGE.b = Math.max(a, b); }
+  avgCache = null; syncRangeInputs();
+}
+function syncRangeInputs() {
+  if (!rangeCtl.a) { return; }
+  rangeCtl.a.value(rangeOn() ? RANGE.a.toFixed(1) : ''); rangeCtl.b.value(rangeOn() ? RANGE.b.toFixed(1) : '');
+}
+const rangeCtl = {};
+function rangeLabel() { return rangeOn() ? `${RANGE.a.toFixed(1)}〜${RANGE.b.toFixed(1)} 秒` : '全体'; }
+// 範囲内の平均スペクトル（範囲を指定していないときは、記録中に足していった平均をそのまま使う）
+function getAvg() {
+  if (!rangeOn()) { return { avg: LOG.avg, n: LOG.avgN }; }
+  const key = RANGE.a + '|' + RANGE.b + '|' + LOG.rec.length + '|' + LOG.interval;
+  if (avgCache && avgCache.key === key) { return avgCache; }
+  let avg = null, n = 0;
+  for (const r of LOG.rec) {
+    if (!r.spec || !inRange(r.t)) { continue; }
+    if (!avg) { avg = new Float64Array(r.spec.length); }
+    if (avg.length !== r.spec.length) { continue; }
+    for (let i = 0; i < avg.length; i++) { avg[i] += r.spec[i]; }
+    n++;
+  }
+  avgCache = { key, avg, n }; return avgCache;
+}
 
 function hsbToRgb(h, s, v) {
   s /= 100; v /= 100;
@@ -1479,6 +1523,7 @@ function resetLog() {
   LOG.t0 = null;
   LOG.avg = null;
   LOG.avgN = 0;
+  setRange(null, null);
 }
 
 // draw() から毎フレーム呼ぶ。音が出ている間だけ、一定間隔で1行ずつ記録する
@@ -1505,7 +1550,8 @@ function logFrame() {
     sat, lvl: dbfs, spl, pi: phonIso, pf: phonFlat, hue, bi, bf,
     ci: (act && hueValid) ? hsbToRgb(hue, sat, bi) : GRAY_RGB,
     cf: (act && hueValid) ? hsbToRgb(hue, sat, bf) : GRAY_RGB,
-    f0: f0Valid ? f0Hz : 0, f0c: f0Valid ? f0Conf : 0, note: f0Valid ? noteInfo.en : '', cents: f0Valid ? noteInfo.cents : '', mode: HUE.mode
+    f0: f0Valid ? f0Hz : 0, f0c: f0Valid ? f0Conf : 0, note: f0Valid ? noteInfo.en : '', cents: f0Valid ? noteInfo.cents : '', mode: HUE.mode,
+    spec: act ? Uint8Array.from(spectrumData) : null
   });
 
   if (act) {                                                     // 平均スペクトル
@@ -1568,6 +1614,7 @@ function buildTimeSeriesCsv() {
   const lines = [
     '# WAVE LAB 時系列データ',
     '# 出力日時,' + new Date().toLocaleString('ja-JP'),
+    '# 保存範囲[秒],' + (rangeOn() ? RANGE.a.toFixed(2) + ',' + RANGE.b.toFixed(2) : '全体'),
     '# 校正: 0 dBFS = ' + splOffset + ' dB SPL',
     '# 適合音域[Hz],' + freqRangeMin().toFixed(0) + ',' + freqRangeMax().toFixed(0),
     '# 音声ファイル,' + csvCell(fp.name || 'なし') + ',ノイズ除去の強さ,' + (fp.alphaUsed === null ? '' : Number(fp.alphaUsed).toFixed(2)) + ',雑音推定,' + csvCell(fp.method || ''),
@@ -1578,6 +1625,7 @@ function buildTimeSeriesCsv() {
      'f0_hz', 'f0_confidence', 'note', 'cents', 'hue_mapping'].join(',')
   ];
   for (const r of LOG.rec) {
+    if (!inRange(r.t)) { continue; }
     lines.push([
       r.t.toFixed(3), r.src, r.fpos === null ? '' : r.fpos.toFixed(3), r.act,
       r.dom.toFixed(1), r.cen.toFixed(1), r.spr.toFixed(1), r.flat.toFixed(2), r.sat.toFixed(1),
@@ -1592,15 +1640,17 @@ function buildTimeSeriesCsv() {
 function buildSpectrumCsv() {
   const lines = [
     '# WAVE LAB 平均スペクトル（リアルタイムFFT, 音が出ている区間の平均）',
+    '# 平均した範囲[秒],' + (rangeOn() ? RANGE.a.toFixed(2) + ',' + RANGE.b.toFixed(2) : '全体'),
     '# phon_iso=その周波数・音圧で耳が感じる大きさ(ISO 226) / phon_flat=補正なし',
     'freq_hz,avg_dbfs,spl_db,phon_iso,phon_flat'
   ];
-  if (LOG.avg && LOG.avgN > 0) {
-    const len = LOG.avg.length, nyq = nyqHz();
+  const A = getAvg();
+  if (A.avg && A.n > 0) {
+    const len = A.avg.length, nyq = nyqHz();
     for (let i = 1; i < len; i++) {
       const f = i * nyq / len;
       if (f < 20 || f > 20000) { continue; }
-      const dbfs = -100 + (LOG.avg[i] / LOG.avgN) / 255 * 70, spl = dbfs + splOffset;
+      const dbfs = -100 + (A.avg[i] / A.n) / 255 * 70, spl = dbfs + splOffset;
       lines.push([f.toFixed(1), dbfs.toFixed(2), spl.toFixed(2), phonFromSPL(f, spl).toFixed(2), constrain(spl, 0, PHON_MAX).toFixed(2)].join(','));
     }
   }
@@ -1622,7 +1672,7 @@ function drawColorMapTrail(x, y, w, h) {
   const n = LOG.rec.length;
   const stride = Math.max(1, Math.ceil(n / 500));
   const pts = [];
-  for (let i = 0; i < n; i += stride) { if (LOG.rec[i].act) { pts.push(LOG.rec[i]); } }
+  for (let i = 0; i < n; i += stride) { if (LOG.rec[i].act && inRange(LOG.rec[i].t)) { pts.push(LOG.rec[i]); } }
   if (pts.length < 2) { return; }
   const px = r => xOfFreq(r.cen, x, w);
   const yI = r => map(r.pi, 0, PHON_MAX, y + h, y, true);
@@ -1669,16 +1719,17 @@ function drawSpectrumCompare(x, y, w, h) {
   }
   noStroke(); fill(85,92,109); textAlign(LEFT, BOTTOM); textSize(12);
   text('平均スペクトル: 補正なし(灰) と 等ラウドネス曲線に沿った大きさ(色)', x, y - 4);
-  if (!LOG.avg || LOG.avgN === 0) {
+  const A = getAvg();
+  if (!A.avg || A.n === 0) {
     fill(150); textAlign(CENTER, CENTER); textSize(13);
-    text('まだ記録がありません（マイク/再生を開始）', x + w / 2, y + h / 2);
+    text(rangeOn() ? 'この範囲に音の記録がありません' : 'まだ記録がありません（マイク/再生を開始）', x + w / 2, y + h / 2);
     return;
   }
-  const len = LOG.avg.length, nyq = nyqHz(), N = 64, bw = w / N;
+  const len = A.avg.length, nyq = nyqHz(), N = 64, bw = w / N;
   noStroke();
   for (let i = 0; i < N; i++) {
     const f0 = FMIN * Math.pow(FMAX / FMIN, i / N), f1 = FMIN * Math.pow(FMAX / FMIN, (i + 1) / N), fc = Math.sqrt(f0 * f1);
-    const mx = specBarValue(LOG.avg, f0, f1, nyq, LOG.avgN);
+    const mx = specBarValue(A.avg, f0, f1, nyq, A.n);
     const spl = -100 + mx / 255 * 70 + splOffset;
     const flat = constrain(spl, 0, PHON_MAX) / PHON_MAX;             // 補正なし
     const iso = phonFromSPL(fc, spl) / PHON_MAX;                      // 補正あり
@@ -1730,6 +1781,7 @@ function drawTimeCharts(x, y, w, h) {
   const rec = LOG.rec, n = rec.length;
   noStroke(); fill(85,92,109); textAlign(LEFT, BOTTOM); textSize(12);
   text('時間軸: 色の変化（上=補正あり / 下=補正なし）と 感じる大きさ[phon]', x, y - 4);
+  TC.w = 0;
   if (n < 2) {
     fill(150); textAlign(CENTER, CENTER); textSize(13);
     text('記録がたまると、ここに時間軸のグラフが出ます', x + w / 2, y + h / 2);
@@ -1781,13 +1833,30 @@ function drawTimeCharts(x, y, w, h) {
   noStroke(); textSize(10); textAlign(LEFT, TOP);
   fill(30, 60, 160); text('━ 補正あり (phon_iso)', x + 8, ly + 4);
   fill(240, 140, 30); text('┅ 補正なし (phon_flat)', x + 150, ly + 4);
+
+  // 保存範囲の表示（範囲の外は白っぽくぼかす）。ドラッグで範囲を選べる
+  Object.assign(TC, { x, y, w: W, h: ly + lh - y, t0, t1 });
+  let ra = null, rb = null;
+  if (TC.drag) { ra = Math.min(TC.anchor, TC.cur); rb = Math.max(TC.anchor, TC.cur); }
+  else if (rangeOn()) { ra = RANGE.a; rb = RANGE.b; }
+  if (ra !== null) {
+    const xa = constrain(x + (ra - t0) / (t1 - t0) * W, x, x + W), xb = constrain(x + (rb - t0) / (t1 - t0) * W, x, x + W);
+    noStroke(); fill(249, 249, 246, 175);
+    rect(x, y, Math.max(0, xa - x), TC.h); rect(xb, y, Math.max(0, x + W - xb), TC.h);
+    stroke(44, 91, 255); strokeWeight(2); line(xa, y - 2, xa, y + TC.h); line(xb, y - 2, xb, y + TC.h);
+    noStroke(); fill(44, 91, 255); textSize(11); textAlign(LEFT, BOTTOM);
+    text(`保存範囲 ${ra.toFixed(1)}〜${rb.toFixed(1)} 秒`, Math.min(xa + 4, x + W - 150), y - 16);
+  } else {
+    noStroke(); fill(129, 136, 152); textSize(10); textAlign(RIGHT, BOTTOM);
+    text('ドラッグで「保存する範囲」を選べます', x + W, y - 16);
+  }
 }
 
 function drawReportOverlay() {
   noStroke(); fill(249,249,246); rect(0, OVERLAY_Y, width, height - OVERLAY_Y);
   const n = LOG.rec.length, dur = n ? LOG.rec[n - 1].t : 0;
   fill(7,14,29); textSize(12); textAlign(LEFT, TOP);
-  text(`${logSource() ? '● 記録中' : '○ 停止中'}  ${n} 点 / ${dur.toFixed(1)} 秒`, 660, OVERLAY_Y + 4);
+  text(`${logSource() ? '● 記録中' : '○ 停止中'}  ${n} 点 / ${dur.toFixed(1)} 秒　保存範囲: ${rangeLabel()}`, 660, OVERLAY_Y + 4);
   fill(85,92,109); textSize(11);
   text(`校正: 0 dBFS = ${splOffset} dB SPL`, 660, OVERLAY_Y + 22);
 
@@ -1827,6 +1896,23 @@ function initReportUI() {
     reportButtons.push(b);
     reg(b, 'report');
   });
+  // 保存・集計する範囲（秒）。時間軸のグラフをドラッグしても指定できる
+  reg(hDiv('保存範囲'), 'report');
+  const mkNum = ph => {
+    const e = hMake('input'); e.elt.type = 'number'; e.elt.min = '0'; e.elt.step = '0.1'; e.elt.placeholder = ph;
+    e.style('width', '78px'); reg(e, 'report'); return e;
+  };
+  rangeCtl.a = mkNum('開始 秒');
+  reg(hDiv('〜'), 'report');
+  rangeCtl.b = mkNum('終了 秒');
+  const apply = () => {
+    const a = parseFloat(rangeCtl.a.value()), b = parseFloat(rangeCtl.b.value());
+    if (isNaN(a) || isNaN(b)) { if (rangeCtl.a.value() === '' && rangeCtl.b.value() === '') { setRange(null, null); } return; }
+    if (b <= a) { toast('終了は開始より後の時間にしてください'); return; }
+    setRange(a, b);
+  };
+  rangeCtl.a.changed(apply); rangeCtl.b.changed(apply);
+  const rb = hBtn('範囲をリセット'); styleButton(rb, '#778ca3'); rb.mousePressed(() => setRange(null, null)); reg(rb, 'report');
 }
 
 // ================= 14) 分析モード =================

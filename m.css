@@ -122,3 +122,5 @@ input[type=range] { width: 100%; height: 34px; accent-color: var(--primary); mar
   .dock .actions { flex: 0 0 46%; max-width: none; margin: 0; }
   #dockFile { flex: 1; margin: 0; order: 2; max-width: none; }
 }
+
+.rg{align-items:center;margin-top:8px}.rg input{width:84px;font:inherit;padding:6px 8px;border:1px solid var(--border);border-radius:var(--radius);background:#fff}

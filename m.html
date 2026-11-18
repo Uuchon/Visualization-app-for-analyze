@@ -107,6 +107,8 @@
       <button class="btn" id="bPng">レポート画像</button>
       <button class="btn ghost" id="bReset">記録をリセット</button>
     </div>
+    <div class="btns rg"><span class="lbl" style="margin:0">保存範囲</span><input id="rgA" type="number" min="0" step="0.1" placeholder="開始 秒" inputmode="decimal"> 〜 <input id="rgB" type="number" min="0" step="0.1" placeholder="終了 秒" inputmode="decimal"><button class="btn ghost" id="bRgReset">全体に戻す</button></div>
+    <p class="hint">録音の最初と最後の雑音を除きたいときは、保存範囲（秒）を入れるか、下の時間軸グラフを横になぞって範囲を選びます。CSV・平均スペクトル・軌跡がこの範囲だけになります。</p>
     <p class="hint">音を出している間、0.05秒ごとに自動で記録されます。ファイルは端末のダウンロードに保存されます。</p>
   </div>
   <div class="card"><div class="lbl">平均スペクトル（補正なし ／ 補正あり）</div><canvas id="cvAvg" height="190"></canvas></div>
