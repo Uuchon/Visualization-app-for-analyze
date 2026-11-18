@@ -202,10 +202,11 @@ const pitchTrace = [];
 let lastTraceT = 0;
 const liveActive = () => S.domA > 0.02 && S.centroid > 0;
 const liveSPL = () => -100 + S.domA * 70 + splOffset;
-const envNoise = { profile: null, profBytes: null, enabled: false, strength: 1.5, floor: 0.08 };
+const envNoise = { profile: null, sr: 48000, enabled: false };   // 強さ・床は nr.js の NRCFG（録音と共通）
+let nrLive = null;
 
 let ctx = null, bus = null, out = null, analyser = null, analyserT = null;
-let specRaw = new Uint8Array(0), specUse = specRaw, tbuf = null;
+let specRaw = new Uint8Array(0), specUse = specRaw, specOut = specRaw, specPre = specRaw, tbuf = null;   // specUse=FFTに入った音(除去後) / specRaw=除去前(除去ONのマイク時のみ別)
 let fftSize = 4096, outVol = 0.6;
 let mode = null;                                       // 'mic' | 'tone' | null
 let stream = null, micNode = null, osc = null, oscGain = null;
@@ -228,7 +229,7 @@ const fp = { gain: null, src: null, orig: null, clean: null, name: '', playing: 
              startedAt: 0, offset: 0, useClean: true, processing: false, progress: 0, job: 0,
              env0: null, env1: null, lvl0: null, lvl1: null, alphaUsed: null, note: '', method: '',
              prof0: null, specOrig: null, specClean: null };
-const nrSet = { alpha: 1.8, mode: 'auto' };
+const nrSet = { mode: 'auto' };
 
 function ensureCtx() {
   if (!ctx) {
@@ -246,8 +247,9 @@ function ensureCtx() {
   }
   return ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
 }
-function allocSpec() { specRaw = new Uint8Array(analyser.frequencyBinCount); specUse = specRaw; }
+function allocSpec() { specOut = new Uint8Array(analyser.frequencyBinCount); specPre = new Uint8Array(analyser.frequencyBinCount); specRaw = specUse = specOut; }
 function stopLive() {                                  // マイク・テスト音を止める（読み込んだファイルは残す）
+  if (nrLive) { try { nrLive.node.disconnect(bus); } catch (e) {} }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   if (micNode) { try { micNode.disconnect(); } catch (e) {} micNode = null; }
   if (osc) { try { osc.stop(); } catch (e) {} try { osc.disconnect(); } catch (e) {} osc = null; }
@@ -264,8 +266,8 @@ function stopAll() {
 function resetLive() {
   f0Buf.length = 0; S.f0ok = false; S.hueOK = false; S.loud = 0; S.domA = 0; S.domF = 0; S.centroid = 0; S.active = false;
   S.rgb = GRAY.slice(); S.harm = []; S.h1h2 = 0; S.flat = 0;
-  if (specRaw.length) { specRaw.fill(0); }
-  specUse = specRaw;
+  if (specOut.length) { specOut.fill(0); }
+  specRaw = specUse = specOut;
 }
 async function startMic() {
   stopLive(); fpPause();
@@ -273,7 +275,11 @@ async function startMic() {
     await ensureCtx();
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     micNode = ctx.createMediaStreamSource(stream);
-    micNode.connect(bus);                              // スピーカーにはつなぎません（ハウリング防止）
+    if (!nrLive) { nrLive = await nrCreateLive(ctx); if (envNoise.profile) { nrLive.setProfile(envNoise.profile, envNoise.sr); } }
+    nrLive.setStrength(NRCFG.alpha, NRCFG.beta); syncNrLive();
+    micNode.connect(nrLive.raw);                       // 除去前（比較用）
+    micNode.connect(nrLive.node);                      // 除去（録音ファイルと同じ計算）
+    nrLive.node.connect(bus);                          // スピーカーにはつなぎません（ハウリング防止）
     mode = 'mic';
     say('マイクで聞いています。声や楽器の音を出してみよう。');
   } catch (err) {
@@ -318,134 +324,15 @@ function updateDockVar() {
 }
 
 // ================= ノイズ除去（録音ファイル） =================
-const NR_N = 2048;
-const NR = { rev: null, cos: null, sin: null, win: null };
-function nrInit() {
-  if (NR.rev) { return; }
-  const N = NR_N, bits = Math.log2(N);
-  NR.rev = new Uint16Array(N);
-  for (let i = 0; i < N; i++) {
-    let r = 0;
-    for (let b = 0; b < bits; b++) { if (i & (1 << b)) { r |= 1 << (bits - 1 - b); } }
-    NR.rev[i] = r;
-  }
-  NR.cos = new Float32Array(N / 2); NR.sin = new Float32Array(N / 2);
-  for (let k = 0; k < N / 2; k++) { NR.cos[k] = Math.cos(2 * Math.PI * k / N); NR.sin[k] = -Math.sin(2 * Math.PI * k / N); }
-  NR.win = new Float32Array(N);
-  for (let i = 0; i < N; i++) { NR.win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N); }
-}
-function nrFFT(re, im, inverse) {
-  const N = NR_N;
-  for (let i = 0; i < N; i++) {
-    const j = NR.rev[i];
-    if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
-  }
-  for (let size = 2; size <= N; size <<= 1) {
-    const half = size >> 1, step = N / size;
-    for (let i = 0; i < N; i += size) {
-      for (let j = 0, k = 0; j < half; j++, k += step) {
-        const wr = NR.cos[k], wi = inverse ? -NR.sin[k] : NR.sin[k];
-        const a = i + j, b = a + half;
-        const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
-        re[b] = re[a] - tr; im[b] = im[a] - ti;
-        re[a] += tr; im[a] += ti;
-      }
-    }
-  }
-  if (inverse) { for (let i = 0; i < N; i++) { re[i] /= N; im[i] /= N; } }
-}
-function nrFrameMag(x, p, re, im, mag) {
-  const N = NR_N, bins = N / 2 + 1;
-  for (let i = 0; i < N; i++) { re[i] = x[p + i] * NR.win[i]; im[i] = 0; }
-  nrFFT(re, im, false);
-  for (let b = 0; b < bins; b++) { mag[b] = Math.sqrt(re[b] * re[b] + im[b] * im[b]); }
-}
+// ノイズ除去の計算本体は nr.js（PC版・スマホ版・録音ファイル・マイクで共通）にあります。
 async function estimateNoiseProfile(x, sr, nmode, hop) {
-  nrInit();
-  const N = NR_N, bins = N / 2 + 1;
-  const nF = Math.floor((x.length - N) / hop) + 1;
-  if (nF < 4) { return null; }
-  const re = new Float32Array(N), im = new Float32Array(N), mag = new Float32Array(bins);
-  const prof = new Float32Array(bins);
-  let method = '';
-  if (nmode === 'head') {
-    const n = Math.min(nF, Math.max(4, Math.floor(0.5 * sr / hop)));
-    for (let f = 0; f < n; f++) { nrFrameMag(x, f * hop, re, im, mag); for (let b = 0; b < bins; b++) { prof[b] += mag[b]; } }
-    for (let b = 0; b < bins; b++) { prof[b] /= n; }
-    method = '冒頭0.5秒';
-  } else {
-    const e = new Float32Array(nF);
-    for (let f = 0; f < nF; f++) {
-      let sum = 0; const p = f * hop;
-      for (let i = 0; i < N; i += 8) { sum += x[p + i] * x[p + i]; }
-      e[f] = sum;
-    }
-    const cand = [];
-    for (let f = 0; f < nF; f++) { if (e[f] > 1e-9) { cand.push(f); } }
-    const pool = cand.length >= 8 ? cand : Array.from({ length: nF }, (_, i) => i);
-    pool.sort((a, b) => e[a] - e[b]);
-    const nq = Math.max(8, Math.floor(pool.length * 0.1)), nl = Math.max(8, Math.floor(pool.length * 0.3));
-    let qe = 0, le = 0;
-    for (let i = 0; i < nq; i++) { qe += e[pool[i]]; }
-    for (let i = 0; i < nl; i++) { le += e[pool[pool.length - 1 - i]]; }
-    const contrast = 10 * Math.log10((le / nl + 1e-12) / (qe / nq + 1e-12));
-    if (contrast >= 12) {
-      for (let i = 0; i < nq; i++) { nrFrameMag(x, pool[i] * hop, re, im, mag); for (let b = 0; b < bins; b++) { prof[b] += mag[b]; } }
-      for (let b = 0; b < bins; b++) { prof[b] /= nq; }
-      method = '静かな区間の平均';
-    } else {
-      const step = Math.max(1, Math.floor(nF / 400)), sel = [];
-      for (let f = 0; f < nF; f += step) { sel.push(f); }
-      const M = sel.length, mags = new Float32Array(M * bins);
-      for (let k = 0; k < M; k++) { nrFrameMag(x, sel[k] * hop, re, im, mag); mags.set(mag, k * bins); }
-      const col = new Float32Array(M), q = Math.floor(M * 0.2);
-      for (let b = 0; b < bins; b++) {
-        for (let k = 0; k < M; k++) { col[k] = mags[k * bins + b]; }
-        col.sort();
-        prof[b] = col[q] * 1.6;
-      }
-      method = '周波数ごとの下位20%';
-    }
-  }
-  fp.method = method;
-  const sm = new Float32Array(bins);
-  for (let b = 0; b < bins; b++) { sm[b] = (prof[Math.max(0, b - 1)] + 2 * prof[b] + prof[Math.min(bins - 1, b + 1)]) / 4; }
-  return sm;
+  const r = nrEstimateProfile(x, sr, nmode, hop);
+  if (!r) { return null; }
+  fp.method = r.method;
+  return r.prof;
 }
-async function denoiseChannel(x, prof, alpha, beta, hop, onProgress, cancelled) {
-  nrInit();
-  const N = NR_N, bins = N / 2 + 1, len = x.length;
-  const xp = new Float32Array(len + 2 * N);
-  xp.set(x, N);
-  const outA = new Float32Array(xp.length), norm = new Float32Array(xp.length);
-  const nF = Math.floor((xp.length - N) / hop) + 1;
-  const re = new Float32Array(N), im = new Float32Array(N);
-  const g = new Float32Array(bins), gs = new Float32Array(bins), gPrev = new Float32Array(bins).fill(1);
-  for (let f = 0; f < nF; f++) {
-    const p = f * hop;
-    for (let i = 0; i < N; i++) { re[i] = xp[p + i] * NR.win[i]; im[i] = 0; }
-    nrFFT(re, im, false);
-    for (let b = 0; b < bins; b++) {
-      const m = Math.sqrt(re[b] * re[b] + im[b] * im[b]) + 1e-12;
-      g[b] = Math.max(1 - alpha * prof[b] / m, beta);
-    }
-    for (let b = 0; b < bins; b++) {
-      const s = (g[Math.max(0, b - 1)] + 2 * g[b] + g[Math.min(bins - 1, b + 1)]) / 4;
-      gs[b] = 0.6 * s + 0.4 * gPrev[b];
-      gPrev[b] = gs[b];
-    }
-    for (let k = 0; k < N; k++) { const gb = gs[k <= N / 2 ? k : N - k]; re[k] *= gb; im[k] *= gb; }
-    nrFFT(re, im, true);
-    for (let i = 0; i < N; i++) { outA[p + i] += re[i] * NR.win[i]; norm[p + i] += NR.win[i] * NR.win[i]; }
-    if (f % 80 === 0) {
-      onProgress(f / nF);
-      await new Promise(r => setTimeout(r, 0));
-      if (cancelled()) { return null; }
-    }
-  }
-  const y = new Float32Array(len);
-  for (let i = 0; i < len; i++) { y[i] = outA[N + i] / Math.max(norm[N + i], 1e-3); }
-  return y;
+function denoiseChannel(x, prof, alpha, beta, hop, onProgress, cancelled) {
+  return nrDenoiseChannel(x, prof, alpha, beta, onProgress, cancelled);
 }
 function computeEnvelope(buf, n) {
   const x = buf.getChannelData(0), seg = Math.max(1, Math.floor(x.length / n)), env = new Float32Array(n);
@@ -475,7 +362,6 @@ function avgSpecDb(x, hop) {
   for (let b = 0; b < bins; b++) { o[b] = 10 * Math.log10(acc[b] / n + 1e-20) - ref; }
   return o;
 }
-const profDb = m => 20 * Math.log10(m + 1e-10) - 20 * Math.log10(NR_N / 4);
 
 async function loadAudioFile(file) {
   stopLive(); fpPause(); resetLive();
@@ -513,7 +399,7 @@ async function runDenoise(isNew) {
   const src = fp.orig, chs = Math.min(2, src.numberOfChannels), hop = src.duration > 120 ? 1024 : 512, ENV_N = 600;
   fp.env0 = computeEnvelope(src, ENV_N);
   fp.lvl0 = envLevelDb(fp.env0);
-  let alpha = nrSet.alpha, outB = null, tooQuiet = false;
+  let alpha = NRCFG.alpha, outB = null, tooQuiet = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     outB = ctx.createBuffer(chs, src.length, src.sampleRate);
     for (let c = 0; c < chs; c++) {
@@ -521,7 +407,7 @@ async function runDenoise(isNew) {
       const prof = await estimateNoiseProfile(x, src.sampleRate, nrSet.mode, hop);
       if (job !== fp.job) { return; }
       if (c === 0) { fp.prof0 = prof; }
-      const y = prof ? await denoiseChannel(x, prof, alpha, 0.05, hop, p => { fp.progress = (c + p) / chs; $('bPlay').textContent = '処理中 ' + Math.round(fp.progress * 100) + '%'; }, () => job !== fp.job) : x;
+      const y = prof ? await denoiseChannel(x, prof, alpha, NRCFG.beta, hop, p => { fp.progress = (c + p) / chs; $('bPlay').textContent = '処理中 ' + Math.round(fp.progress * 100) + '%'; }, () => job !== fp.job) : x;
       if (job !== fp.job || !y) { return; }
       outB.copyToChannel(y, c);
     }
@@ -593,16 +479,17 @@ function onNr() {
 const fmtTime = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
 // ================= 環境ノイズ除去（マイク）・校正 =================
-function applyEnvNoise(spec) {
-  if (!envNoise.enabled || !envNoise.profile || envNoise.profile.length !== spec.length) { return spec; }
-  const o = applyEnvNoise.buf && applyEnvNoise.buf.length === spec.length ? applyEnvNoise.buf : (applyEnvNoise.buf = new Uint8Array(spec.length));
-  const k = envNoise.strength, fl = envNoise.floor, prof = envNoise.profile;
-  for (let i = 0; i < spec.length; i++) {
-    const p = P_TBL[spec[i]];
-    const q = Math.max(p - k * prof[i], fl * p);
-    o[i] = clamp(Math.round((10 * Math.log10(q + 1e-20) + 100) / 70 * 255), 0, 255);
-  }
-  return o;
+function syncNrLive() { if (nrLive) { nrLive.setOn(envNoise.enabled && !!envNoise.profile); } }
+function setEnvProfile(prof, sr) {                         // マイク登録・録音からの登録の両方がここを通る
+  envNoise.profile = prof; envNoise.sr = sr; envNoise.enabled = !!prof;
+  if (nrLive) { nrLive.setProfile(prof, sr); syncNrLive(); }
+  syncEnvState();
+}
+function setNrStrength(v) {                                // 録音ファイルとマイクで同じ強さ
+  NRCFG.alpha = v;
+  if (nrLive) { nrLive.setStrength(NRCFG.alpha, NRCFG.beta); }
+  for (const id of ['sNr', 'sEnv']) { if (Number($(id).value) !== v) { $(id).value = String(v); } }
+  $('vNr').textContent = v.toFixed(1); $('vEnv').textContent = v.toFixed(1);
 }
 const CAL_MS = 3000;
 const calib = { on: false, kind: '', label: '', t0: 0, frames: 0, sumP: null, freqs: [], lvls: [] };
@@ -610,6 +497,7 @@ function startCalib(kind) {
   const ok = kind === 'noise' ? mode === 'mic' : (mode !== null || fp.playing);
   if (!ok) { say(kind === 'noise' ? '先に下の「マイク」を押してください' : '先にマイク・テスト音・ファイル再生のどれかを始めてください', true); return; }
   Object.assign(calib, { on: true, kind, t0: performance.now(), frames: 0, sumP: null, freqs: [], lvls: [] });
+  if (kind === 'noise' && nrLive) { nrLive.learnStart(); }
   calib.label = kind === 'noise' ? '環境ノイズ' : (kind === 'range' ? '音域' : '音量');
   say(kind === 'noise' ? '3秒間、静かにしてください（環境の音を記録します）'
     : (kind === 'range' ? '3秒間、いろいろな高さの声や音を出してください' : '3秒間、いちばん大きい声や音を出してください'));
@@ -619,11 +507,7 @@ function updateCalib() {
   const now = performance.now();
   if (now - calib.t0 < CAL_MS) {
     if (calib.kind === 'noise') {
-      if (specRaw.length > 0) {
-        if (!calib.sumP || calib.sumP.length !== specRaw.length) { calib.sumP = new Float64Array(specRaw.length); calib.frames = 0; }
-        for (let i = 0; i < specRaw.length; i++) { calib.sumP[i] += P_TBL[specRaw[i]]; }
-        calib.frames++;
-      }
+      /* 雑音の学習は nrLive が音声のまま行う（startCalib で開始） */
     } else if (calib.kind === 'range') {
       const f = S.f0ok ? S.f0 : S.centroid;
       if (S.domA > 0.05 && f > 0) { calib.freqs.push(f); }
@@ -634,10 +518,11 @@ function updateCalib() {
   }
   calib.on = false;
   if (calib.kind === 'noise') {
-    if (calib.frames < 10) { say('うまく記録できませんでした。もう一度試してください', true); return; }
-    envNoise.profile = Float32Array.from(calib.sumP, v => v / calib.frames);
-    envNoise.enabled = true;
-    say('環境ノイズを登録しました（除去 ON）');
+    if (!nrLive) { say('うまく記録できませんでした。もう一度試してください', true); return; }
+    nrLive.learnFinish().then(p => {
+      if (!p) { say('うまく記録できませんでした。もう一度試してください', true); return; }
+      setEnvProfile(p, ctx.sampleRate); say('環境ノイズを登録しました（除去 ON）');
+    });
   } else if (calib.kind === 'range') {
     if (calib.freqs.length < 10) { say('音が小さくて測れませんでした。もう一度試してください', true); return; }
     const a = calib.freqs.slice().sort((x, y) => x - y);
@@ -661,8 +546,12 @@ function updateCalib() {
 
 // ================= 1フレームの解析 =================
 function analyze() {
-  analyser.getByteFrequencyData(specRaw);
-  specUse = applyEnvNoise(specRaw);
+  analyser.getByteFrequencyData(specOut); specUse = specOut;
+  if (mode === 'mic' && nrLive && envNoise.enabled && envNoise.profile) {          // 除去前のスペクトル（比較用）
+    if (nrLive.raw.fftSize !== analyser.fftSize) { nrLive.raw.fftSize = analyser.fftSize; }
+    if (specPre.length !== nrLive.raw.frequencyBinCount) { specPre = new Uint8Array(nrLive.raw.frequencyBinCount); }
+    nrLive.raw.getByteFrequencyData(specPre); specRaw = specPre;
+  } else { specRaw = specOut; }
   const sp = specUse, len = sp.length, sr = ctx.sampleRate, nyq = sr / 2;
 
   let mx = 0, mi = 0;
@@ -895,9 +784,10 @@ function specBarValue(arr, f0, f1, nyq, div) {
 const nyqNow = () => ctx ? ctx.sampleRate / 2 : 22050;
 function envProfBytes() {
   if (!envNoise.profile) { return null; }
-  if (envNoise._src !== envNoise.profile) {
-    envNoise._src = envNoise.profile;
-    envNoise._pb = Array.from(envNoise.profile, p => clamp(Math.round((10 * Math.log10(p + 1e-20) + 100) / 70 * 255), 0, 255));
+  const key = specRaw.length + '|' + ctx.sampleRate;
+  if (envNoise._src !== envNoise.profile || envNoise._key !== key) {
+    envNoise._src = envNoise.profile; envNoise._key = key;
+    envNoise._pb = nrProfBytes(envNoise.profile, envNoise.sr, specRaw.length, ctx.sampleRate);
   }
   return envNoise._pb;
 }
@@ -917,7 +807,7 @@ function drawFFTChart(g, W, H, o) {
       g.fillStyle = hsbCss(hueForFreq(Math.sqrt(f0 * f1)), 80, 95);
       g.fillRect(x + i * bw + 1, y + h - bh - 4, Math.max(1, bw - 2), bh);
     }
-    const pb = envNoise.enabled && envNoise.profile && specRaw.length === envNoise.profile.length ? envProfBytes() : null;
+    const pb = envNoise.enabled && envNoise.profile && specRaw !== specUse ? envProfBytes() : null;
     if (pb && o.raw) {
       const line = (arr, c) => {
         g.strokeStyle = c; g.lineWidth = 1.5; g.beginPath();
@@ -1346,8 +1236,7 @@ function applyPreset(v) {
 function syncSettings() {
   $('sSpl').value = String(splOffset); $('vSpl').textContent = splOffset;
   $('sVol').value = String(outVol); $('vVol').textContent = Math.round(outVol * 100) + '%';
-  $('sNr').value = String(nrSet.alpha); $('vNr').textContent = nrSet.alpha.toFixed(1);
-  $('sEnv').value = String(envNoise.strength); $('vEnv').textContent = envNoise.strength.toFixed(1);
+  setNrStrength(NRCFG.alpha);
   syncEnvState();
 }
 function syncEnvState() {
@@ -1410,21 +1299,25 @@ function init() {
   $('sSpan').addEventListener('input', e => { HUE.span = Number(e.target.value); syncMapUI(); });
   $('sSpl').addEventListener('input', e => { splOffset = Number(e.target.value); $('vSpl').textContent = splOffset; dirty = true; });
   $('sVol').addEventListener('input', e => { outVol = Number(e.target.value); $('vVol').textContent = Math.round(outVol * 100) + '%'; if (out) { out.gain.value = outVol; } });
-  $('sNr').addEventListener('input', e => { nrSet.alpha = Number(e.target.value); $('vNr').textContent = nrSet.alpha.toFixed(1); });
+  $('sNr').addEventListener('input', e => setNrStrength(Number(e.target.value)));
   $('sNr').addEventListener('change', () => { if (fp.orig) { runDenoise().then(() => { say('除去をやり直しました'); }); } });
   $('stNrMode').addEventListener('change', e => { nrSet.mode = e.target.value; if (fp.orig) { runDenoise().then(() => { say('除去をやり直しました'); }); } });
-  $('sEnv').addEventListener('input', e => { envNoise.strength = Number(e.target.value); $('vEnv').textContent = envNoise.strength.toFixed(1); });
+  $('sEnv').addEventListener('input', e => setNrStrength(Number(e.target.value)));
   $('stFft').addEventListener('change', e => {
     fftSize = Number(e.target.value);
     if (analyser) { analyser.fftSize = fftSize; allocSpec(); }
-    envNoise.profile = null; envNoise.enabled = false; LOG.avg = null; LOG.avgN = 0; syncEnvState();
-    say('FFTの細かさを変えました。環境ノイズは登録し直してください');
+    LOG.avg = null; LOG.avgN = 0;                   // 雑音プロファイルは FFT の細かさに依存しない（登録し直し不要）
+    say('FFTの細かさを変えました');
   });
   $('bCalRange').addEventListener('click', () => startCalib('range'));
   $('bCalLevel').addEventListener('click', () => startCalib('level'));
   $('bCalNoise').addEventListener('click', () => startCalib('noise'));
-  $('bEnvDel').addEventListener('click', () => { envNoise.profile = null; envNoise.enabled = false; syncEnvState(); say('環境ノイズの登録を削除しました'); });
-  $('bEnvToggle').addEventListener('click', () => { if (envNoise.profile) { envNoise.enabled = !envNoise.enabled; syncEnvState(); } });
+  $('bEnvDel').addEventListener('click', () => { setEnvProfile(null, envNoise.sr); say('環境ノイズの登録を削除しました'); });
+  $('bEnvFromFile').addEventListener('click', () => {
+    if (!fp.prof0 || !fp.orig) { say('先に音声ファイルを読み込んでください', true); return; }
+    setEnvProfile(Float32Array.from(fp.prof0), fp.orig.sampleRate); say('録音ファイルの雑音を、環境ノイズとして登録しました（除去 ON）');
+  });
+  $('bEnvToggle').addEventListener('click', () => { if (envNoise.profile) { envNoise.enabled = !envNoise.enabled; syncNrLive(); syncEnvState(); } });
   $('bCsvT').addEventListener('click', () => { downloadText('wavelab_timeseries_' + stamp() + '.csv', buildTimeSeriesCsv()); say('時系列CSVを保存しました'); });
   $('bCsvS').addEventListener('click', () => { downloadText('wavelab_spectrum_' + stamp() + '.csv', buildSpectrumCsv()); say('スペクトルCSVを保存しました'); });
   $('bPng').addEventListener('click', reportPng);

@@ -362,8 +362,7 @@ function draw() {
     audioProcessor.setFreq(sweepFreq);
   }
 
-  spectrumRaw = (fft && fft.analyser) ? fft.analyze() : [];
-  spectrumData = applyEnvNoise(spectrumRaw);             // 環境ノイズ除去が ON ならここで引く
+  updateSpectra();                                       // マイクの環境ノイズ除去は、音声の段階（nr.js）で済んでいる
 
   analyzeFrequencyContent();
   updateCalib();
@@ -917,7 +916,7 @@ class AudioProcessor {
     await ensureUserAudioStarted();
 
     if (this.micStarted && this.micStream) {
-      safeSetFFTInput(this.micSource);
+      safeSetFFTInput(nrLive ? nrLive.node : this.micSource);
       return;
     }
 
@@ -934,7 +933,11 @@ class AudioProcessor {
       if (context.state === 'suspended') await context.resume();
 
       const source = context.createMediaStreamSource(stream);
-      safeSetFFTInput(source);
+      if (!nrLive) { nrLive = await nrCreateLive(context); if (envNoise.profile) { nrLive.setProfile(envNoise.profile, envNoise.sr); } }
+      nrLive.setStrength(NRCFG.alpha, NRCFG.beta); syncNrLive();
+      source.connect(nrLive.raw);                       // 除去前（比較用）
+      source.connect(nrLive.node);                      // 除去（録音ファイルと同じ計算）
+      safeSetFFTInput(nrLive.node);                     // 除去後の音を FFT に入力
 
       this.micStream = stream;
       this.micSource = source;
@@ -997,184 +1000,16 @@ class AudioProcessor {
 //   3) 処理後の波形(AudioBuffer)を、元の音声と切り替えながら再生
 //   再生音は fp.gain を通して既存の FFT(AnalyserNode) に入るので、
 //   FFT・等ラウドネス曲線・色の変化が再生と同時に動きます。
-const NR_N = 2048;                       // FFTサイズ
-const NR = { rev: null, cos: null, sin: null, win: null };
-
-function nrInit() {
-  if (NR.rev) return;
-  const N = NR_N, bits = Math.log2(N);
-  NR.rev = new Uint16Array(N);
-  for (let i = 0; i < N; i++) {
-    let r = 0;
-    for (let b = 0; b < bits; b++) { if (i & (1 << b)) { r |= 1 << (bits - 1 - b); } }
-    NR.rev[i] = r;
-  }
-  NR.cos = new Float32Array(N / 2);
-  NR.sin = new Float32Array(N / 2);
-  for (let k = 0; k < N / 2; k++) {
-    NR.cos[k] = Math.cos(2 * Math.PI * k / N);
-    NR.sin[k] = -Math.sin(2 * Math.PI * k / N);
-  }
-  NR.win = new Float32Array(N);
-  for (let i = 0; i < N; i++) { NR.win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N); }   // Hann
-}
-
-// 基数2の反復FFT（in-place）。inverse=true で逆変換（1/N 込み）
-function nrFFT(re, im, inverse) {
-  const N = NR_N;
-  for (let i = 0; i < N; i++) {
-    const j = NR.rev[i];
-    if (j > i) {
-      let t = re[i]; re[i] = re[j]; re[j] = t;
-      t = im[i]; im[i] = im[j]; im[j] = t;
-    }
-  }
-  for (let size = 2; size <= N; size <<= 1) {
-    const half = size >> 1, step = N / size;
-    for (let i = 0; i < N; i += size) {
-      for (let j = 0, k = 0; j < half; j++, k += step) {
-        const wr = NR.cos[k], wi = inverse ? -NR.sin[k] : NR.sin[k];
-        const a = i + j, b = a + half;
-        const tr = re[b] * wr - im[b] * wi;
-        const ti = re[b] * wi + im[b] * wr;
-        re[b] = re[a] - tr; im[b] = im[a] - ti;
-        re[a] += tr;        im[a] += ti;
-      }
-    }
-  }
-  if (inverse) {
-    for (let i = 0; i < N; i++) { re[i] /= N; im[i] /= N; }
-  }
-}
-
-function nrFrameMag(x, p, re, im, mag) {
-  const N = NR_N, bins = N / 2 + 1;
-  for (let i = 0; i < N; i++) { re[i] = x[p + i] * NR.win[i]; im[i] = 0; }
-  nrFFT(re, im, false);
-  for (let b = 0; b < bins; b++) { mag[b] = Math.sqrt(re[b] * re[b] + im[b] * im[b]); }
-}
-
-// 雑音プロファイル（各周波数ビンの雑音の大きさ）を推定
-//   head : 冒頭0.5秒の平均
-//   auto : 静かな区間が十分に静かなら、その平均。静かな区間がない録音(常に何か鳴っている)なら
-//          各周波数ごとに「時間方向の下位20%」を雑音とみなす（演奏そのものを雑音と誤認しにくい）
+// ノイズ除去の計算本体は nr.js（PC版・スマホ版・録音ファイル・マイクで共通）にあります。
+// ここは、nr.js の関数を今までの呼び名で使えるようにする薄い包みです。
 async function estimateNoiseProfile(x, sr, mode, hop) {
-  nrInit();
-  const N = NR_N, bins = N / 2 + 1;
-  const nF = Math.floor((x.length - N) / hop) + 1;
-  if (nF < 4) { return null; }
-  const re = new Float32Array(N), im = new Float32Array(N), mag = new Float32Array(bins);
-  let prof = new Float32Array(bins);
-  let method = '';
-
-  if (mode === 'head') {
-    const n = Math.min(nF, Math.max(4, Math.floor(0.5 * sr / hop)));
-    for (let f = 0; f < n; f++) {
-      nrFrameMag(x, f * hop, re, im, mag);
-      for (let b = 0; b < bins; b++) { prof[b] += mag[b]; }
-    }
-    for (let b = 0; b < bins; b++) { prof[b] /= n; }
-    method = '冒頭0.5秒';
-  } else {
-    const e = new Float32Array(nF);
-    for (let f = 0; f < nF; f++) {
-      let sum = 0;
-      const p = f * hop;
-      for (let i = 0; i < N; i += 8) { sum += x[p + i] * x[p + i]; }
-      e[f] = sum;
-    }
-    const cand = [];
-    for (let f = 0; f < nF; f++) { if (e[f] > 1e-9) { cand.push(f); } }   // 完全な無音は除外
-    const pool = cand.length >= 8 ? cand : Array.from({ length: nF }, (_, i) => i);
-    pool.sort((a, b) => e[a] - e[b]);
-    const nq = Math.max(8, Math.floor(pool.length * 0.1));
-    const nl = Math.max(8, Math.floor(pool.length * 0.3));
-    let qe = 0, le = 0;
-    for (let i = 0; i < nq; i++) { qe += e[pool[i]]; }
-    for (let i = 0; i < nl; i++) { le += e[pool[pool.length - 1 - i]]; }
-    const contrast = 10 * Math.log10((le / nl + 1e-12) / (qe / nq + 1e-12));
-
-    if (contrast >= 12) {                                   // 雑音だけの静かな区間がある
-      for (let i = 0; i < nq; i++) {
-        nrFrameMag(x, pool[i] * hop, re, im, mag);
-        for (let b = 0; b < bins; b++) { prof[b] += mag[b]; }
-      }
-      for (let b = 0; b < bins; b++) { prof[b] /= nq; }
-      method = '静かな区間の平均';
-    } else {                                                // 静かな区間がない → 周波数ごとの下位20%
-      const step = Math.max(1, Math.floor(nF / 400));
-      const sel = [];
-      for (let f = 0; f < nF; f += step) { sel.push(f); }
-      const M = sel.length;
-      const mags = new Float32Array(M * bins);
-      for (let k = 0; k < M; k++) {
-        nrFrameMag(x, sel[k] * hop, re, im, mag);
-        mags.set(mag, k * bins);
-      }
-      const col = new Float32Array(M);
-      const q = Math.floor(M * 0.2);
-      for (let b = 0; b < bins; b++) {
-        for (let k = 0; k < M; k++) { col[k] = mags[k * bins + b]; }
-        col.sort();
-        prof[b] = col[q] * 1.6;                             // 下位20% → 平均的な雑音の大きさへ補正
-      }
-      method = '周波数ごとの下位20%';
-    }
-  }
-  fp.method = method;
-
-  const sm = new Float32Array(bins);                        // 3点平滑
-  for (let b = 0; b < bins; b++) {
-    sm[b] = (prof[Math.max(0, b - 1)] + 2 * prof[b] + prof[Math.min(bins - 1, b + 1)]) / 4;
-  }
-  return sm;
+  const r = nrEstimateProfile(x, sr, mode, hop);
+  if (!r) { return null; }
+  fp.method = r.method;
+  return r.prof;
 }
-
-// 1チャンネルのスペクトル減算。alpha=強さ, beta=床(残す割合)
-async function denoiseChannel(x, prof, alpha, beta, hop, onProgress, cancelled) {
-  nrInit();
-  const N = NR_N, bins = N / 2 + 1, len = x.length;
-  const xp = new Float32Array(len + 2 * N);
-  xp.set(x, N);
-  const out = new Float32Array(xp.length), norm = new Float32Array(xp.length);
-  const nF = Math.floor((xp.length - N) / hop) + 1;
-  const re = new Float32Array(N), im = new Float32Array(N);
-  const g = new Float32Array(bins), gs = new Float32Array(bins);
-  const gPrev = new Float32Array(bins).fill(1);
-
-  for (let f = 0; f < nF; f++) {
-    const p = f * hop;
-    for (let i = 0; i < N; i++) { re[i] = xp[p + i] * NR.win[i]; im[i] = 0; }
-    nrFFT(re, im, false);
-
-    for (let b = 0; b < bins; b++) {
-      const m = Math.sqrt(re[b] * re[b] + im[b] * im[b]) + 1e-12;
-      g[b] = Math.max(1 - alpha * prof[b] / m, beta);                 // スペクトル減算のゲイン
-    }
-    for (let b = 0; b < bins; b++) {                                  // 周波数・時間方向の平滑化
-      const s = (g[Math.max(0, b - 1)] + 2 * g[b] + g[Math.min(bins - 1, b + 1)]) / 4;
-      gs[b] = 0.6 * s + 0.4 * gPrev[b];                               // （ミュージカルノイズ対策）
-      gPrev[b] = gs[b];
-    }
-    for (let k = 0; k < N; k++) {
-      const gb = gs[k <= N / 2 ? k : N - k];
-      re[k] *= gb; im[k] *= gb;
-    }
-    nrFFT(re, im, true);
-
-    for (let i = 0; i < N; i++) {
-      out[p + i] += re[i] * NR.win[i];
-      norm[p + i] += NR.win[i] * NR.win[i];
-    }
-    if (f % 80 === 0) {
-      onProgress(f / nF);
-      await new Promise(r => setTimeout(r, 0));                       // 画面を固めない
-      if (cancelled()) return null;
-    }
-  }
-  const y = new Float32Array(len);
-  for (let i = 0; i < len; i++) { y[i] = out[N + i] / Math.max(norm[N + i], 1e-3); }
-  return y;
+function denoiseChannel(x, prof, alpha, beta, hop, onProgress, cancelled) {
+  return nrDenoiseChannel(x, prof, alpha, beta, onProgress, cancelled);
 }
 
 // ---- 読み込み・処理の流れ ----
@@ -1249,7 +1084,7 @@ async function runDenoise(isNew) {
   fp.env0 = computeEnvelope(src, ENV_N);
   fp.lvl0 = envLevelDb(fp.env0);
 
-  let alpha = nrSlider ? Number(nrSlider.value()) : 1.8;
+  let alpha = NRCFG.alpha;
   let out = null;
   let tooQuiet = false;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1260,7 +1095,7 @@ async function runDenoise(isNew) {
       if (job !== fp.job) { return; }
       if (c === 0) { fp.prof0 = prof; }
       const y = prof
-        ? await denoiseChannel(x, prof, alpha, 0.05, hop, p => { fp.progress = (c + p) / chs; }, () => job !== fp.job)
+        ? await denoiseChannel(x, prof, alpha, NRCFG.beta, hop, p => { fp.progress = (c + p) / chs; }, () => job !== fp.job)
         : x;
       if (job !== fp.job || !y) { return; }
       out.copyToChannel(y, c);
@@ -1588,7 +1423,6 @@ function avgSpecDb(x, hop) {
   for (let b = 0; b < bins; b++) { out[b] = 10 * Math.log10(acc[b] / n + 1e-20) - ref; }
   return out;
 }
-function profDb(m) { return 20 * Math.log10(m + 1e-10) - 20 * Math.log10(NR_N / 4); }
 
 // ---- CSV ----
 function csvCell(v) {
@@ -2369,18 +2203,33 @@ function syncSettingsControls() {
 // ---------- 環境ノイズ除去（マイク入力用） ----------
 // 静かにして3秒間の環境音（エアコン・外の音など）の平均スペクトルを登録し、
 // 以降はそのパワーを各周波数から引いて（スペクトル減算）解析に使う。
-const envNoise = { profile: null, profBytes: null, enabled: false, strength: 1.5, floor: 0.08 };
+// マイクの環境ノイズ除去は、録音ファイルの除去と同じ計算（nr.js の NRStream）を、
+// マイク音声が FFT に入る前にかけます。強さ・床は NRCFG（録音と共通）。
+const envNoise = { profile: null, sr: 48000, enabled: false };
 let spectrumRaw = [];
-const P_TBL = Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255 * 70) / 10));
-function applyEnvNoise(spec) {
-  if (!envNoise.enabled || !envNoise.profile || envNoise.profile.length !== spec.length) { return spec; }
-  const out = new Array(spec.length), k = envNoise.strength, fl = envNoise.floor, prof = envNoise.profile;
-  for (let i = 0; i < spec.length; i++) {
-    const p = P_TBL[spec[i]];
-    const q = Math.max(p - k * prof[i], fl * p);                   // 引きすぎない（床 = 元の8%）
-    out[i] = constrain(Math.round((10 * Math.log10(q + 1e-20) + 100) / 70 * 255), 0, 255);
-  }
-  return out;
+let nrLive = null;                                       // マイク用のノイズ除去ノード（startMicrophone で作る）
+function syncNrLive() { if (nrLive) { nrLive.setOn(envNoise.enabled && !!envNoise.profile); } }
+function updateSpectra() {
+  const cleaned = (fft && fft.analyser) ? fft.analyze() : [];
+  spectrumData = cleaned;
+  if (micActive && nrLive && envNoise.enabled && envNoise.profile && fft && fft.analyser) {
+    if (nrLive.raw.fftSize !== fft.analyser.fftSize) { nrLive.raw.fftSize = fft.analyser.fftSize; }
+    const d = new Uint8Array(nrLive.raw.frequencyBinCount);
+    nrLive.raw.getByteFrequencyData(d);
+    spectrumRaw = Array.from(d);                         // 除去前のスペクトル（グラフの比較用）
+  } else { spectrumRaw = cleaned; }
+}
+// 強さ（録音ファイルとマイクで同じ値）。2つのスライダーを連動させる
+function setNrStrength(v, from) {
+  NRCFG.alpha = v;
+  if (nrLive) { nrLive.setStrength(NRCFG.alpha, NRCFG.beta); }
+  const set = (c) => { if (c && c.s && Number(c.s.value()) !== v) { c.s.value(v); c.upd(); } };
+  if (from !== 'env') { set(settingsCtl.envS); }
+  if (from !== 'file') { set(settingsCtl.nrS); }
+}
+function setEnvProfile(prof, sr) {                       // 雑音プロファイルを登録（マイク登録・録音から登録の両方がここを通る）
+  envNoise.profile = prof; envNoise.sr = sr; envNoise.enabled = !!prof;
+  if (nrLive) { nrLive.setProfile(prof, sr); syncNrLive(); }
 }
 function onEnvToggle() {
   if (!envNoise.profile) {
@@ -2389,6 +2238,7 @@ function onEnvToggle() {
     return;
   }
   envNoise.enabled = !envNoise.enabled;
+  syncNrLive();
 }
 let lastEnvLabel = '';
 function syncEnvButton() {
@@ -2411,6 +2261,7 @@ function startCalib(kind) {
   calib.kind = kind;
   calib.label = kind === 'noise' ? '環境ノイズ' : (kind === 'range' ? '音域' : '音量');
   calib.t0 = millis(); calib.frames = 0; calib.sumP = null; calib.freqs = []; calib.lvls = [];
+  if (kind === 'noise' && nrLive) { nrLive.learnStart(); }
   isCalibrating = true;
   toast(kind === 'noise' ? '3秒間、静かにしてください（環境の音を記録します）'
     : (kind === 'range' ? '3秒間、いろいろな高さの声や音を出してください' : '3秒間、いちばん大きい声や音を出してください'));
@@ -2419,11 +2270,7 @@ function updateCalib() {
   if (!isCalibrating) { return; }
   if (millis() - calib.t0 < calibrationDuration) {
     if (calib.kind === 'noise') {
-      if (spectrumRaw.length > 0) {
-        if (!calib.sumP || calib.sumP.length !== spectrumRaw.length) { calib.sumP = new Float64Array(spectrumRaw.length); calib.frames = 0; }
-        for (let i = 0; i < spectrumRaw.length; i++) { calib.sumP[i] += P_TBL[spectrumRaw[i]]; }
-        calib.frames++;
-      }
+      /* 雑音の学習は nrLive が音声のまま行う（startCalib で開始） */
     } else if (calib.kind === 'range') {
       const f = f0Valid ? f0Hz : spectralCentroid;
       if (dominantAmplitude > 0.05 && f > 0) { calib.freqs.push(f); }
@@ -2434,11 +2281,12 @@ function updateCalib() {
   }
   isCalibrating = false;
   if (calib.kind === 'noise') {
-    if (calib.frames < 10) { toast('うまく記録できませんでした。もう一度試してください'); return; }
-    envNoise.profile = Float32Array.from(calib.sumP, v => v / calib.frames);
-    envNoise.profBytes = Array.from(envNoise.profile, p => constrain(Math.round((10 * Math.log10(p + 1e-20) + 100) / 70 * 255), 0, 255));
-    envNoise.enabled = true;
-    toast('環境ノイズを登録しました（除去 ON）');
+    if (!nrLive) { toast('うまく記録できませんでした。もう一度試してください'); return; }
+    nrLive.learnFinish().then(p => {
+      if (!p) { toast('うまく記録できませんでした。もう一度試してください'); return; }
+      setEnvProfile(p, getAudioContext().sampleRate);
+      toast('環境ノイズを登録しました（除去 ON）');
+    });
   } else if (calib.kind === 'range') {
     if (calib.freqs.length < 10) { toast('音が小さくて測れませんでした。もう一度試してください'); return; }
     const a = calib.freqs.slice().sort((x, y) => x - y);
@@ -2465,9 +2313,8 @@ function setFftSize(n) {
   if (!fft) { return; }
   fft.setSize(n);
   fftBins = n / 2;
-  envNoise.profile = null; envNoise.profBytes = null; envNoise.enabled = false;   // 周波数の刻みが変わるので登録し直し
   LOG.avg = null; LOG.avgN = 0;
-  toast('FFTの細かさを変えました。環境ノイズは登録し直してください');
+  toast('FFTの細かさを変えました');
 }
 
 // ---------- 設定ページの部品づくり ----------
@@ -2524,14 +2371,20 @@ function initSettingsUI() {
 
   UI_CTX = 'set-noise';
   // ③ ノイズ除去
-  const nr = sSlider(2, 46, '除去の強さ（読み込んだ録音）', 0.5, 4, 1.8, 0.1, v => v.toFixed(1), () => {});
-  nrSlider = nr.s;
-  nrSlider.elt.addEventListener('change', () => { if (fp.orig) { runDenoise(); } });
+  const nr = sSlider(2, 46, 'ノイズ除去の強さ（録音ファイル・マイク共通）', 0.5, 4, 1.8, 0.1, v => v.toFixed(1), () => {});
+  nrSlider = nr.s; settingsCtl.nrS = nr;
+  nrSlider.elt.addEventListener('input', () => setNrStrength(Number(nrSlider.value()), 'file'));
+  nrSlider.elt.addEventListener('change', () => { setNrStrength(Number(nrSlider.value()), 'file'); if (fp.orig) { runDenoise(); } });
   nrSelect = sSelect(2, 94, [['雑音の取り方: 自動（静かな部分）', 'auto'], ['雑音の取り方: 冒頭0.5秒', 'head']], 'auto', 300, () => { if (fp.orig) { runDenoise(); } });
   sButton(2, 154, '環境ノイズを登録（3秒・静かに）', '#10ac84', 270, () => startCalib('noise'));
-  sButton(2, 154, '削除', '#778ca3', 90, () => { envNoise.profile = null; envNoise.profBytes = null; envNoise.enabled = false; toast('環境ノイズの登録を削除しました'); });
+  sButton(2, 154, '削除', '#778ca3', 90, () => { setEnvProfile(null, envNoise.sr); toast('環境ノイズの登録を削除しました'); });
   settingsLayout[settingsLayout.length - 1].dx = 280;
-  settingsCtl.envS = sSlider(2, 196, '環境ノイズ除去の強さ（マイク入力）', 1, 3, envNoise.strength, 0.1, v => v.toFixed(1), v => { envNoise.strength = v; });
+  settingsCtl.envS = sSlider(2, 196, 'ノイズ除去の強さ（上と連動）', 0.5, 4, NRCFG.alpha, 0.1, v => v.toFixed(1), v => setNrStrength(v, 'env'));
+  sButton(2, 246, '録音ファイルの雑音を、マイクの環境ノイズにする', '#4a69bd', 330, () => {
+    if (!fp.prof0 || !fp.orig) { toast('先に音声ファイルを読み込んでください'); return; }
+    setEnvProfile(Float32Array.from(fp.prof0), fp.orig.sampleRate);
+    toast('録音ファイルで推定した雑音を、環境ノイズとして登録しました（除去 ON）');
+  });
   UI_CTX = 'set-display';
   // ④ 表示
   sSelect(2, 340, [['FFTの細かさ: 標準（約47Hz刻み）', '1024'], ['FFTの細かさ: 高（約12Hz刻み）', '4096'], ['FFTの細かさ: 最高（約6Hz刻み）', '8192']], '4096', 300, v => setFftSize(Number(v)));
@@ -2646,14 +2499,15 @@ function drawFFTChart(x, y, w, h) {
     fill(hsbColor(hueForFreq(Math.sqrt(f0 * f1)), 80, 95));
     rect(x + i * (w / N) + 1, y + h - bh - 4, w / N - 2, bh, 2);
   }
-  const nrOn = envNoise.enabled && envNoise.profBytes && spectrumRaw.length === len;
+  const nrOn = envNoise.enabled && envNoise.profile && spectrumRaw.length === len;
+  const profBytes = nrOn ? nrProfBytes(envNoise.profile, envNoise.sr, spectrumRaw.length, getAudioContext().sampleRate) : null;
   if (nrOn) {                                                       // 環境ノイズ除去の効き目: 灰=除去前 / 赤=登録した雑音
     push(); noFill(); strokeWeight(1.5);
     stroke(150, 160, 185); beginShape();
     for (let i = 0; i < N; i++) { const [f0, f1] = barF(i); vertex(x + (i + 0.5) * (w / N), y + h - 4 - specBarValue(spectrumRaw, f0, f1, nyq, 1) / 255 * (h - 12)); }
     endShape();
     stroke(220, 60, 60); beginShape();
-    for (let i = 0; i < N; i++) { const [f0, f1] = barF(i); vertex(x + (i + 0.5) * (w / N), y + h - 4 - specBarValue(envNoise.profBytes, f0, f1, nyq, 1) / 255 * (h - 12)); }
+    for (let i = 0; i < N; i++) { const [f0, f1] = barF(i); vertex(x + (i + 0.5) * (w / N), y + h - 4 - specBarValue(profBytes, f0, f1, nyq, 1) / 255 * (h - 12)); }
     endShape();
     pop();
     noStroke(); fill(85,92,109); textSize(10); textAlign(LEFT, TOP);

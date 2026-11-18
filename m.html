@@ -144,11 +144,12 @@
 
   <div class="card">
     <h3><span>03</span>ノイズ除去</h3>
-    <p class="hint"><b>録音ファイル</b>は、音そのものから雑音を引きます。<b>マイク</b>は、静かにして登録した環境ノイズ（エアコン・外の音など）を、解析から引きます。</p>
-    <div class="sl"><label>除去の強さ（読み込んだ録音）<b id="vNr"></b></label><input type="range" id="sNr" min="0.5" max="4" step="0.1"></div>
+    <p class="hint"><b>録音ファイルもマイクも、同じ方法</b>（スペクトル減算）で雑音を引きます。録音は雑音を自動で推定し、マイクは静かにして登録した環境ノイズ（エアコン・外の音など）を使います。強さは共通です。</p>
+    <div class="sl"><label>ノイズ除去の強さ（録音・マイク共通）<b id="vNr"></b></label><input type="range" id="sNr" min="0.5" max="4" step="0.1"></div>
     <select id="stNrMode"><option value="auto">雑音の取り方: 自動（静かな部分）</option><option value="head">雑音の取り方: 冒頭0.5秒</option></select>
-    <div class="sl"><label>環境ノイズ除去の強さ（マイク）<b id="vEnv"></b></label><input type="range" id="sEnv" min="1" max="3" step="0.1"></div>
+    <div class="sl"><label>ノイズ除去の強さ（上と連動）<b id="vEnv"></b></label><input type="range" id="sEnv" min="0.5" max="4" step="0.1"></div>
     <div class="row2 btnrow"><button class="btn" id="bCalNoise">環境ノイズを登録（3秒・静かに）</button><button class="btn ghost" id="bEnvDel">削除</button></div>
+    <button class="btn wideb" id="bEnvFromFile">録音ファイルの雑音を、マイクの環境ノイズにする</button>
     <p class="hint" id="envState">環境ノイズ: 未登録</p>
     <button class="btn wideb" id="bEnvToggle">環境ノイズ除去: OFF</button>
   </div>
@@ -178,6 +179,7 @@
   </div>
 </div>
 
+<script src="nr.js"></script>
 <script src="m.js"></script>
 </body>
 </html>
