@@ -401,6 +401,14 @@ function windowResized() {
 }
 
 
+
+// 実際の再生/入力のサンプリング周波数（Macなどは48000Hz）からナイキスト周波数を求める。
+// ここを 22050 固定にすると、周波数が 22050/24000 = 0.919 倍（440Hz→404Hz）にずれる。
+function nyqHz() {
+  try { if (typeof getAudioContext === 'function') { return getAudioContext().sampleRate / 2; } } catch (e) {}
+  return 22050;
+}
+
 // ================= 5) 音声解析 =================
 function analyzeFrequencyContent() {
   if (!spectrumData || spectrumData.length === 0) {
@@ -418,7 +426,7 @@ function analyzeFrequencyContent() {
   let weightedFreq = 0;
   let maxAmplitude = 0;
   let maxFreqIndex = 0;
-  const nyquist = typeof sampleRate === 'function' ? sampleRate() / 2 : 22050;
+  const nyquist = nyqHz();
 
   // 主要周波数（最大ピーク）
   for (let i = 1; i < spectrumData.length; i++) {
@@ -878,7 +886,7 @@ class HarmonicAnalyzer {
 
     let harmonicStrength = 0;
     let totalStrength = 0;
-    const nyquist = typeof sampleRate === 'function' ? sampleRate() / 2 : 22050;
+    const nyquist = nyqHz();
 
     for (let harmonic = 1; harmonic <= 8; harmonic++) {
       const harmonicFreq = fundamentalFreq * harmonic;
@@ -1588,7 +1596,7 @@ function buildSpectrumCsv() {
     'freq_hz,avg_dbfs,spl_db,phon_iso,phon_flat'
   ];
   if (LOG.avg && LOG.avgN > 0) {
-    const len = LOG.avg.length, nyq = typeof sampleRate === 'function' ? sampleRate() / 2 : 22050;
+    const len = LOG.avg.length, nyq = nyqHz();
     for (let i = 1; i < len; i++) {
       const f = i * nyq / len;
       if (f < 20 || f > 20000) { continue; }
@@ -1666,7 +1674,7 @@ function drawSpectrumCompare(x, y, w, h) {
     text('まだ記録がありません（マイク/再生を開始）', x + w / 2, y + h / 2);
     return;
   }
-  const len = LOG.avg.length, nyq = typeof sampleRate === 'function' ? sampleRate() / 2 : 22050, N = 64, bw = w / N;
+  const len = LOG.avg.length, nyq = nyqHz(), N = 64, bw = w / N;
   noStroke();
   for (let i = 0; i < N; i++) {
     const f0 = FMIN * Math.pow(FMAX / FMIN, i / N), f1 = FMIN * Math.pow(FMAX / FMIN, (i + 1) / N), fc = Math.sqrt(f0 * f1);
@@ -2543,7 +2551,7 @@ function drawFFTChart(x, y, w, h) {
     noStroke(); fill(129,136,152); textAlign(CENTER, TOP); text(fmtHz(f), gx, y + h + 3);
   }
   const N = 64, len = spectrumData.length;
-  const nyq = typeof sampleRate === 'function' ? sampleRate() / 2 : 22050;
+  const nyq = nyqHz();
   const barF = i => [FMIN * Math.pow(FMAX / FMIN, i / N), FMIN * Math.pow(FMAX / FMIN, (i + 1) / N)];
   noStroke();
   for (let i = 0; i < N; i++) {
