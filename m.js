@@ -54,9 +54,10 @@ const FLAT_LO_HZ = 50, FLAT_HI_HZ = 10000, FLAT_TONAL_DB = -45, FLAT_NOISY_DB = 
 const FLAT_RANGES = [40, 60, 80];                  // 研究用: 比較する補正幅[dB]（CSV には3つとも保存する）
 let FLAT_RANGE_DB = 40;                            // 彩度に使う補正幅。URL に ?flatrange=60 で変更（研究用）
 try { const q = Number(new URLSearchParams(location.search).get('flatrange')); if (FLAT_RANGES.includes(q)) { FLAT_RANGE_DB = q; } } catch (e) {}
+let flatTonalRef = FLAT_TONAL_DB;                  // 彩度100にする平坦度（暫定: 補正幅と帯域ビン数から理論値。混合音実験後に確定）
 let flatSet = { std: 0, c40: 0, c60: 0, c80: 0 };  // 直近フレームの平坦度（標準 / 補正40・60・80 dB）
 // 標準: 帯域内の各ビンのパワーの 幾何平均/算術平均 [dB]（≦0。下限処理なし）
-// 補正: ピークから R dB より下を R dB の位置にそろえてから同じ計算 → 純音≒FLAT_TONAL_DB になるよう規格化
+// 補正: ピークから R dB より下を R dB の位置にそろえてから同じ計算（規格化なし）。SF40 ≧ SF60 ≧ SF80 ≧ 標準 になる
 function computeFlatnessDb(spec, nyq) {
   const len = spec.length;
   const a = Math.max(1, Math.floor(FLAT_LO_HZ / nyq * len));
@@ -71,11 +72,11 @@ function computeFlatnessDb(spec, nyq) {
     for (let i = 0; i < n; i++) { const d = Math.max(db[i], fl); sd += d; sl += Math.pow(10, d / 10); }
     return sd / n - 10 * Math.log10(sl / n);
   };
-  const corr = R => calc(R) / Math.max(10, R - 10 * Math.log10(n)) * -FLAT_TONAL_DB;
-  flatSet = { std: calc(null), c40: corr(40), c60: corr(60), c80: corr(80) };
+  flatSet = { std: calc(null), c40: calc(40), c60: calc(60), c80: calc(80) };   // 規格化なし（生の dB）
+  flatTonalRef = -Math.max(6, FLAT_RANGE_DB - 10 * Math.log10(n));            // 暫定: 純音のときの理論値（彩度の下端）
   return flatSet['c' + FLAT_RANGE_DB];
 }
-const satFromFlatness = db => 100 + (20 - 100) * clamp((db - FLAT_TONAL_DB) / (FLAT_NOISY_DB - FLAT_TONAL_DB), 0, 1);
+const satFromFlatness = db => 100 + (20 - 100) * clamp((db - flatTonalRef) / (FLAT_NOISY_DB - flatTonalRef), 0, 1);
 
 function hsbToRgb(h, s, v) {
   s /= 100; v /= 100;
@@ -707,7 +708,7 @@ function buildTimeSeriesCsv() {
     '# 適合音域[Hz],' + rangeMin().toFixed(0) + ',' + rangeMax().toFixed(0),
     '# 音声ファイル,' + csvCell(fp.name || 'なし') + ',ノイズ除去の強さ,' + (fp.alphaUsed === null ? '' : Number(fp.alphaUsed).toFixed(2)) + ',雑音推定,' + csvCell(fp.method || ''),
     '# phon_iso = 等ラウドネス曲線(ISO 226)に沿った大きさ / phon_flat = 補正なし(音圧をそのまま大きさとみなす)',
-    '# 平坦度: std=標準(下限なし) / corrN=ピークからN dBより下を下限にそろえ純音≒'+FLAT_TONAL_DB+'dBに規格化 / used=彩度に使った値(補正幅 '+FLAT_RANGE_DB+' dB, 帯域 '+FLAT_LO_HZ+'-'+FLAT_HI_HZ+' Hz)',
+    '# 平坦度: std=標準(下限なし) / corrN=ピークからN dBより下を下限にそろえた値(規格化なし) / used=彩度に使った値(補正幅 '+FLAT_RANGE_DB+' dB, 帯域 '+FLAT_LO_HZ+'-'+FLAT_HI_HZ+' Hz)',
     '# 色: 色相=設定した対応(hue_mapping) 彩度=スペクトル平坦度 明度=phon.  hex_iso=補正あり hex_flat=補正なし',
     ['time_s', 'source', 'file_pos_s', 'active', 'dominant_hz', 'centroid_hz', 'spread_hz', 'flatness_std_db', 'flatness_corr40_db', 'flatness_corr60_db', 'flatness_corr80_db', 'flatness_used_db', 'saturation_pct',
      'level_dbfs', 'spl_db', 'phon_iso', 'phon_flat', 'hue_deg', 'brightness_iso_pct', 'brightness_flat_pct', 'hex_iso', 'hex_flat',
