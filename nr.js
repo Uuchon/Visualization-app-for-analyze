@@ -178,7 +178,17 @@ function nrEstimateProfile(x, sr, mode, hop) {
       for (let k = 0; k < M; k++) { nrFrameMag(x, sel[k] * hop, re, im, mag); mags.set(mag, k * bins); }
       const col = new Float32Array(M), q = Math.floor(M * 0.2);
       for (let b = 0; b < bins; b++) { for (let k = 0; k < M; k++) { col[k] = mags[k * bins + b]; } col.sort(); prof[b] = col[q] * 1.6; }
-      method = '周波数ごとの下位20%';
+      // 鳴りっぱなしの音（一定のトーン・楽器の持続音）は、雑音と区別できず一緒に消えてしまう。
+      // そこで、細い山（周りの中央値の1.5倍を超える部分）は雑音とみなさず、広い帯域にわたる雑音の床だけを雑音とする。
+      const W = 20, win = new Float32Array(2 * W + 1), clipped = new Float32Array(bins);
+      for (let b = 0; b < bins; b++) {
+        let n = 0;
+        for (let k = Math.max(0, b - W); k <= Math.min(bins - 1, b + W); k++) { win[n++] = prof[k]; }
+        const part = win.subarray(0, n).slice().sort(), med = part[n >> 1];
+        clipped[b] = Math.min(prof[b], med * 1.5);
+      }
+      prof.set(clipped);
+      method = '周波数ごとの下位20%（持続する音は雑音にしない）';
     }
   }
   const sm = new Float32Array(bins);
