@@ -309,19 +309,29 @@ function briFromPhon(phon) { return map(phon / PHON_MAX, 0.02, 1.0, 42, 100, tru
 const FLAT_LO_HZ = 50, FLAT_HI_HZ = 10000;       // 評価する帯域
 const FLAT_TONAL_DB = -45;                         // この値以下 → 彩度100（純音的）
 const FLAT_NOISY_DB = -3;                          // この値以上 → 彩度20（ノイズ的）
+const FLAT_RANGES = [40, 60, 80];                  // 研究用: 比較する補正幅[dB]（CSV には3つとも保存する）
+let FLAT_RANGE_DB = 40;                            // 彩度に使う補正幅。URL に ?flatrange=60 で変更（研究用）
+try { const q = Number(new URLSearchParams(location.search).get('flatrange')); if (FLAT_RANGES.includes(q)) { FLAT_RANGE_DB = q; } } catch (e) {}
+let flatSet = { std: 0, c40: 0, c60: 0, c80: 0 };  // 直近フレームの平坦度（標準 / 補正40・60・80 dB）
+// 標準: 帯域内の各ビンのパワーの 幾何平均/算術平均 [dB]（≦0。下限処理なし）
+// 補正: ピークから R dB より下を R dB の位置にそろえてから同じ計算 → 純音≒FLAT_TONAL_DB になるよう規格化
 function computeFlatnessDb(spec, nyq) {
   const len = spec.length;
   const a = Math.max(1, Math.floor(FLAT_LO_HZ / nyq * len));
   const b = Math.min(len, Math.ceil(FLAT_HI_HZ / nyq * len));
-  if (b - a < 8) { return 0; }
-  let sumLin = 0, sumDb = 0;
-  for (let i = a; i < b; i++) {
-    const db = -100 + spec[i] / 255 * DB_SPAN;          // AnalyserNode の byte → dBFS
-    sumDb += db;
-    sumLin += Math.pow(10, db / 10);               // パワー
-  }
-  const n = b - a;
-  return sumDb / n - 10 * Math.log10(sumLin / n);  // 幾何平均(dB) − 算術平均(dB)
+  if (b - a < 8) { flatSet = { std: 0, c40: 0, c60: 0, c80: 0 }; return 0; }
+  const n = b - a, db = new Float32Array(n);
+  let pk = -200;
+  for (let i = 0; i < n; i++) { db[i] = -100 + spec[a + i] / 255 * DB_SPAN; if (db[i] > pk) { pk = db[i]; } }
+  const calc = R => {
+    const fl = R === null ? -1e9 : pk - R;
+    let sd = 0, sl = 0;
+    for (let i = 0; i < n; i++) { const d = Math.max(db[i], fl); sd += d; sl += Math.pow(10, d / 10); }
+    return sd / n - 10 * Math.log10(sl / n);
+  };
+  const corr = R => calc(R) / Math.max(10, R - 10 * Math.log10(n)) * -FLAT_TONAL_DB;
+  flatSet = { std: calc(null), c40: corr(40), c60: corr(60), c80: corr(80) };
+  return flatSet['c' + FLAT_RANGE_DB];
 }
 function satFromFlatness(db) { return map(db, FLAT_TONAL_DB, FLAT_NOISY_DB, 100, 20, true); }
 
@@ -1383,7 +1393,7 @@ function logFrame() {
   const bi = briFromPhon(phonIso), bf = briFromPhon(phonFlat);
   LOG.rec.push({
     t, src, fpos: src === 'file' ? fpPos() : null, act,
-    dom: dominantFreq, cen: spectralCentroid, spr: spectralSpread, flat: spectralFlatnessDb,
+    dom: dominantFreq, cen: spectralCentroid, spr: spectralSpread, flat: spectralFlatnessDb, fs: flatSet.std, f40: flatSet.c40, f60: flatSet.c60, f80: flatSet.c80,
     sat, lvl: dbfs, spl, pi: phonIso, pf: phonFlat, hue, bi, bf,
     ci: (act && hueValid) ? hsbToRgb(hue, sat, bi) : GRAY_RGB,
     cf: (act && hueValid) ? hsbToRgb(hue, sat, bf) : GRAY_RGB,
@@ -1455,8 +1465,9 @@ function buildTimeSeriesCsv() {
     '# 適合音域[Hz],' + freqRangeMin().toFixed(0) + ',' + freqRangeMax().toFixed(0),
     '# 音声ファイル,' + csvCell(fp.name || 'なし') + ',ノイズ除去の強さ,' + (fp.alphaUsed === null ? '' : Number(fp.alphaUsed).toFixed(2)) + ',雑音推定,' + csvCell(fp.method || ''),
     '# phon_iso = 等ラウドネス曲線(ISO 226)に沿った大きさ / phon_flat = 補正なし(音圧をそのまま大きさとみなす)',
+    '# 平坦度: std=標準(下限なし) / corrN=ピークからN dBより下を下限にそろえ純音≒'+FLAT_TONAL_DB+'dBに規格化 / used=彩度に使った値(補正幅 '+FLAT_RANGE_DB+' dB, 帯域 '+FLAT_LO_HZ+'-'+FLAT_HI_HZ+' Hz)',
     '# 色: 色相=設定した対応(hue_mapping) 彩度=スペクトル平坦度 明度=phon.  hex_iso=補正あり hex_flat=補正なし',
-    ['time_s', 'source', 'file_pos_s', 'active', 'dominant_hz', 'centroid_hz', 'spread_hz', 'flatness_db', 'saturation_pct',
+    ['time_s', 'source', 'file_pos_s', 'active', 'dominant_hz', 'centroid_hz', 'spread_hz', 'flatness_std_db', 'flatness_corr40_db', 'flatness_corr60_db', 'flatness_corr80_db', 'flatness_used_db', 'saturation_pct',
      'level_dbfs', 'spl_db', 'phon_iso', 'phon_flat', 'hue_deg', 'brightness_iso_pct', 'brightness_flat_pct', 'hex_iso', 'hex_flat',
      'f0_hz', 'f0_confidence', 'note', 'cents', 'hue_mapping'].join(',')
   ];
@@ -1464,7 +1475,7 @@ function buildTimeSeriesCsv() {
     if (!inRange(r.t)) { continue; }
     lines.push([
       r.t.toFixed(3), r.src, r.fpos === null ? '' : r.fpos.toFixed(3), r.act,
-      r.dom.toFixed(1), r.cen.toFixed(1), r.spr.toFixed(1), r.flat.toFixed(2), r.sat.toFixed(1),
+      r.dom.toFixed(1), r.cen.toFixed(1), r.spr.toFixed(1), r.fs.toFixed(2), r.f40.toFixed(2), r.f60.toFixed(2), r.f80.toFixed(2), r.flat.toFixed(2), r.sat.toFixed(1),
       r.lvl.toFixed(2), r.spl.toFixed(2), r.pi.toFixed(2), r.pf.toFixed(2),
       r.hue.toFixed(1), r.bi.toFixed(1), r.bf.toFixed(1), rgbHex(r.ci), rgbHex(r.cf),
       r.f0.toFixed(1), r.f0c.toFixed(2), r.note, r.cents === '' ? '' : r.cents.toFixed(1), r.mode
