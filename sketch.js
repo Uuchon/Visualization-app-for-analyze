@@ -93,6 +93,7 @@ class SafeFFT {
     const allowedSizes = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
     this.analyser.fftSize = allowedSizes.includes(fftSize) ? fftSize : 2048;
     this.analyser.smoothingTimeConstant = constrain(smoothing, 0, 1);
+    this.analyser.minDecibels = -100; this.analyser.maxDecibels = 0;
 
     this._data = new Uint8Array(this.analyser.frequencyBinCount);
     this._sourceNode = null;
@@ -194,6 +195,7 @@ let frequencyMapper;
 let harmonicAnalyzer;
 
 let dominantFreq = 0;
+const DB_SPAN = 100;            // AnalyserNode: -100〜0 dBFS（以前は -30 で頭打ちになっていた）
 let dominantAmplitude = 0;
 let perceivedLoudness = 0;      // 0〜1 (= phon / PHON_MAX)
 let circleRadius = 50;
@@ -284,7 +286,7 @@ function phonFromSPL(freq, spl) {
 // amp: 0〜1 (FFTバイト値/255)  →  戻り値: 0〜1 (phon / PHON_MAX)
 function getLoudnessPerceived(freq, amp) {
   if (!freq || !amp) return 0;
-  const dbfs = -100 + amp * 70;      // AnalyserNode 既定の min/maxDecibels (-100〜-30)
+  const dbfs = -100 + amp * DB_SPAN;      // AnalyserNode 既定の min/maxDecibels (-100〜-30)
   const spl = dbfs + splOffset;
   return constrain(phonFromSPL(freq, spl) / PHON_MAX, 0, 1);
 }
@@ -314,7 +316,7 @@ function computeFlatnessDb(spec, nyq) {
   if (b - a < 8) { return 0; }
   let sumLin = 0, sumDb = 0;
   for (let i = a; i < b; i++) {
-    const db = -100 + spec[i] / 255 * 70;          // AnalyserNode の byte → dBFS
+    const db = -100 + spec[i] / 255 * DB_SPAN;          // AnalyserNode の byte → dBFS
     sumDb += db;
     sumLin += Math.pow(10, db / 10);               // パワー
   }
@@ -570,7 +572,7 @@ function drawStatusPanel() {
     [`適合音域: ${frequencyMapper.minFreq.toFixed(0)} Hz 〜 ${frequencyMapper.maxFreq.toFixed(0)} Hz`, 1],
     [`環境ノイズ除去: ${envNoise.profile ? (envNoise.enabled ? 'ON' : '登録済み(OFF)') : '未登録'}`, 2],
     [`純音らしさ(平坦度): ${spectralFlatnessDb.toFixed(1)} dB → 彩度 ${currentSaturation.toFixed(0)} %`, 2],
-    [`入力レベル: ${(-100 + dominantAmplitude * 70).toFixed(0)} dBFS`, 2]
+    [`入力レベル: ${(-100 + dominantAmplitude * DB_SPAN).toFixed(0)} dBFS`, 2]
   ];
   const maxLines = Math.max(2, Math.floor((height - 198) / 25));
   for (let i = 0; i < Math.min(lines.length, maxLines); i++) {
@@ -609,7 +611,7 @@ function xOfFreq(f, x, w) {
   return x + w * (Math.log10(constrain(f, FMIN, FMAX)) - Math.log10(FMIN)) / (Math.log10(FMAX) - Math.log10(FMIN));
 }
 function fmtHz(f) { return f >= 1000 ? (f / 1000) + 'k' : String(f); }
-function liveSPL() { return -100 + dominantAmplitude * 70 + splOffset; }
+function liveSPL() { return -100 + dominantAmplitude * DB_SPAN + splOffset; }
 function liveActive() { return dominantAmplitude > 0.02 && spectralCentroid > 0; }
 
 function drawMarker(px, py, col) {                 // 白ふち + 黒ふちで、暗い色の上でも見える
@@ -1372,7 +1374,7 @@ function logFrame() {
   LOG.last = t;
 
   const act = liveActive() ? 1 : 0;
-  const dbfs = -100 + dominantAmplitude * 70;
+  const dbfs = -100 + dominantAmplitude * DB_SPAN;
   const spl = dbfs + splOffset;
   const phonIso = act ? perceivedLoudness * PHON_MAX : 0;       // 補正あり: ISO 226
   const phonFlat = act ? constrain(spl, 0, PHON_MAX) : 0;       // 補正なし: 音圧をそのまま
@@ -1484,7 +1486,7 @@ function buildSpectrumCsv() {
     for (let i = 1; i < len; i++) {
       const f = i * nyq / len;
       if (f < 20 || f > 20000) { continue; }
-      const dbfs = -100 + (A.avg[i] / A.n) / 255 * 70, spl = dbfs + splOffset;
+      const dbfs = -100 + (A.avg[i] / A.n) / 255 * DB_SPAN, spl = dbfs + splOffset;
       lines.push([f.toFixed(1), dbfs.toFixed(2), spl.toFixed(2), phonFromSPL(f, spl).toFixed(2), constrain(spl, 0, PHON_MAX).toFixed(2)].join(','));
     }
   }
@@ -1564,7 +1566,7 @@ function drawSpectrumCompare(x, y, w, h) {
   for (let i = 0; i < N; i++) {
     const f0 = FMIN * Math.pow(FMAX / FMIN, i / N), f1 = FMIN * Math.pow(FMAX / FMIN, (i + 1) / N), fc = Math.sqrt(f0 * f1);
     const mx = specBarValue(A.avg, f0, f1, nyq, A.n);
-    const spl = -100 + mx / 255 * 70 + splOffset;
+    const spl = -100 + mx / 255 * DB_SPAN + splOffset;
     const flat = constrain(spl, 0, PHON_MAX) / PHON_MAX;             // 補正なし
     const iso = phonFromSPL(fc, spl) / PHON_MAX;                      // 補正あり
     fill(150, 160, 180, 170); rect(x + i * bw + 1, y + h - flat * (h - 10) - 4, bw - 2, flat * (h - 10), 2);
@@ -2275,7 +2277,7 @@ function updateCalib() {
       const f = f0Valid ? f0Hz : spectralCentroid;
       if (dominantAmplitude > 0.05 && f > 0) { calib.freqs.push(f); }
     } else if (dominantAmplitude > 0.02) {
-      calib.lvls.push(-100 + dominantAmplitude * 70);
+      calib.lvls.push(-100 + dominantAmplitude * DB_SPAN);
     }
     return;
   }
@@ -2403,7 +2405,7 @@ function drawSettingsPage() {
     '色を決める音: ' + hueSourceLabel(),
     'いまの周波数: ' + (hueSrcFreq > 0 ? Math.round(hueSrcFreq) + ' Hz' : '—'),
     '色相 ' + (hueValid && liveActive() ? currentHue.toFixed(0) + '°' : '—') + '　彩度 ' + currentSaturation.toFixed(0) + '%　明度 ' + briFromPhon(perceivedLoudness * PHON_MAX).toFixed(0) + '%',
-    '入力レベル: ' + (-100 + dominantAmplitude * 70).toFixed(0) + ' dBFS　（校正値 ' + splOffset + '）',
+    '入力レベル: ' + (-100 + dominantAmplitude * DB_SPAN).toFixed(0) + ' dBFS　（校正値 ' + splOffset + '）',
     '環境ノイズ除去: ' + (envNoise.profile ? (envNoise.enabled ? 'ON' : '登録済み・OFF') : '未登録')
   ];
   lines.forEach((l, i) => text(l, x + 140, y + 30 + i * 22));

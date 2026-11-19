@@ -46,7 +46,8 @@ function phonFromSPL(freq, spl) {
 const PHON_MAX = 90, FMIN = 20, FMAX = 20000;
 let splOffset = 100;                                   // 0 dBFS を何 dB SPL とみなすか
 const briFromPhon = phon => 42 + (100 - 42) * clamp((phon / PHON_MAX - 0.02) / 0.98, 0, 1);   // 下限42%: 暗い音でも色が見えるように
-const P_TBL = Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255 * 70) / 10));
+const DB_SPAN = 100;
+const P_TBL = Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255 * DB_SPAN) / 10));
 
 // ---------- 彩度: スペクトル平坦度 ----------
 const FLAT_LO_HZ = 50, FLAT_HI_HZ = 10000, FLAT_TONAL_DB = -45, FLAT_NOISY_DB = -3;
@@ -56,7 +57,7 @@ function computeFlatnessDb(spec, nyq) {
   if (b - a < 8) { return 0; }
   let sumLin = 0, sumDb = 0;
   for (let i = a; i < b; i++) {
-    const db = -100 + spec[i] / 255 * 70;
+    const db = -100 + spec[i] / 255 * DB_SPAN;
     sumDb += db;
     sumLin += Math.pow(10, db / 10);
   }
@@ -201,7 +202,7 @@ const f0Buf = [];
 const pitchTrace = [];
 let lastTraceT = 0;
 const liveActive = () => S.domA > 0.02 && S.centroid > 0;
-const liveSPL = () => -100 + S.domA * 70 + splOffset;
+const liveSPL = () => -100 + S.domA * DB_SPAN + splOffset;
 const envNoise = { profile: null, sr: 48000, enabled: false };   // 強さ・床は nr.js の NRCFG（録音と共通）
 let nrLive = null;
 
@@ -238,7 +239,7 @@ function ensureCtx() {
     bus = ctx.createGain();
     out = ctx.createGain(); out.gain.value = outVol; out.connect(ctx.destination);
     analyser = ctx.createAnalyser();
-    analyser.fftSize = fftSize; analyser.smoothingTimeConstant = 0.8; analyser.minDecibels = -100; analyser.maxDecibels = -30;
+    analyser.fftSize = fftSize; analyser.smoothingTimeConstant = 0.8; analyser.minDecibels = -100; analyser.maxDecibels = 0;
     analyserT = ctx.createAnalyser();
     analyserT.fftSize = 4096; analyserT.smoothingTimeConstant = 0;
     bus.connect(analyser); bus.connect(analyserT);
@@ -512,7 +513,7 @@ function updateCalib() {
       const f = S.f0ok ? S.f0 : S.centroid;
       if (S.domA > 0.05 && f > 0) { calib.freqs.push(f); }
     } else if (S.domA > 0.02) {
-      calib.lvls.push(-100 + S.domA * 70);
+      calib.lvls.push(-100 + S.domA * DB_SPAN);
     }
     return;
   }
@@ -557,7 +558,7 @@ function analyze() {
   let mx = 0, mi = 0;
   for (let i = 1; i < len; i++) { if (sp[i] > mx) { mx = sp[i]; mi = i; } }
   S.domA = mx / 255; S.domF = mi * nyq / len;
-  S.loud = S.domA > 0 ? clamp(phonFromSPL(S.domF, -100 + S.domA * 70 + splOffset) / PHON_MAX, 0, 1) : 0;
+  S.loud = S.domA > 0 ? clamp(phonFromSPL(S.domF, -100 + S.domA * DB_SPAN + splOffset) / PHON_MAX, 0, 1) : 0;
 
   let tot = 0, wf = 0;
   for (let i = 1; i < len; i++) {
@@ -658,7 +659,7 @@ function logFrame() {
   const t = now - LOG.t0;
   if (t - LOG.last < LOG.interval) { return; }
   LOG.last = t;
-  const act = liveActive() ? 1 : 0, dbfs = -100 + S.domA * 70, spl = dbfs + splOffset;
+  const act = liveActive() ? 1 : 0, dbfs = -100 + S.domA * DB_SPAN, spl = dbfs + splOffset;
   const phonIso = act ? S.loud * PHON_MAX : 0, phonFlat = act ? clamp(spl, 0, PHON_MAX) : 0;
   const hue = (act && S.hueOK) ? S.hue : 0, sat = act ? S.sat : 0, bi = briFromPhon(phonIso), bf = briFromPhon(phonFlat);
   LOG.rec.push({
@@ -725,7 +726,7 @@ function buildSpectrumCsv() {
     for (let i = 1; i < len; i++) {
       const f = i * nyq / len;
       if (f < 20 || f > 20000) { continue; }
-      const dbfs = -100 + (A.avg[i] / A.n) / 255 * 70, spl = dbfs + splOffset;
+      const dbfs = -100 + (A.avg[i] / A.n) / 255 * DB_SPAN, spl = dbfs + splOffset;
       lines.push([f.toFixed(1), dbfs.toFixed(2), spl.toFixed(2), phonFromSPL(f, spl).toFixed(2), clamp(spl, 0, PHON_MAX).toFixed(2)].join(','));
     }
   }
@@ -932,7 +933,7 @@ function drawAvgCompare(g, W, H) {
   const nyq = nyqNow(), N = 56, bw = w / N;
   for (let i = 0; i < N; i++) {
     const f0 = FMIN * Math.pow(FMAX / FMIN, i / N), f1 = FMIN * Math.pow(FMAX / FMIN, (i + 1) / N), fc = Math.sqrt(f0 * f1);
-    const mx = specBarValue(A.avg, f0, f1, nyq, A.n), spl = -100 + mx / 255 * 70 + splOffset;
+    const mx = specBarValue(A.avg, f0, f1, nyq, A.n), spl = -100 + mx / 255 * DB_SPAN + splOffset;
     const flat = clamp(spl, 0, PHON_MAX) / PHON_MAX, iso = phonFromSPL(fc, spl) / PHON_MAX;
     g.fillStyle = 'rgba(150,160,180,.67)'; g.fillRect(x + i * bw + 1, y + h - flat * (h - 10) - 4, Math.max(1, bw - 2), flat * (h - 10));
     g.fillStyle = hsbCss(hueForFreq(fc), 80, 95); g.fillRect(x + i * bw + bw * 0.25, y + h - iso * (h - 10) - 4, bw * 0.5, iso * (h - 10));
@@ -1118,7 +1119,7 @@ function metrics() {
   $('mH').textContent = S.active ? Math.round(S.hue) + '°' : '—';
   $('mS').textContent = S.active ? Math.round(S.sat) + ' %' : '—';
   $('mB').textContent = S.active ? Math.round(S.bri) + ' %' : '—';
-  $('mLv').textContent = live ? Math.round(-100 + S.domA * 70) + ' dBFS' : '—';
+  $('mLv').textContent = live ? Math.round(-100 + S.domA * DB_SPAN) + ' dBFS' : '—';
 }
 function hsbStrips() {
   const hh = S.active ? S.hue : 210, ss = liveActive() ? S.sat : 90;

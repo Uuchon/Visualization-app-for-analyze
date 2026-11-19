@@ -125,7 +125,7 @@ function nrProfBytes(prof, sr, nBins, ctxSr) {
   for (let i = 0; i < nBins; i++) {
     const f = i * (ctxSr / 2) / nBins, x = Math.min(prof.length - 1.001, f * NR_N / sr), j = Math.floor(x), t = x - j;
     const m = prof[j] * (1 - t) + prof[j + 1] * t, db = profDb(m);
-    out[i] = Math.max(0, Math.min(255, Math.round((db + 100) / 70 * 255)));
+    out[i] = Math.max(0, Math.min(255, Math.round((db + 100) / 100 * 255)));
   }
   return out;
 }
@@ -235,7 +235,7 @@ class NRProc extends AudioWorkletProcessor {
   }
 }
 registerProcessor('nrproc', NRProc);`;
-  const raw = ctx.createAnalyser(); raw.fftSize = 2048; raw.smoothingTimeConstant = 0.8; raw.minDecibels = -100; raw.maxDecibels = -30;
+  const raw = ctx.createAnalyser(); raw.fftSize = 2048; raw.smoothingTimeConstant = 0.8; raw.minDecibels = -100; raw.maxDecibels = 0;
   const api = { raw, kind: '', sr: ctx.sampleRate, prof: null, profSr: ctx.sampleRate, resolveLearn: null };
   let useWorklet = false;
   if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
