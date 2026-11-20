@@ -311,7 +311,8 @@ const FLAT_TONAL_DB = -45;                         // この値以下 → 彩度
 const FLAT_NOISY_DB = -3;                          // この値以上 → 彩度20（ノイズ的）
 // 補正重心（比較用）: ピークから R dB 以内のビンだけで、標準と同じ重み(byte値)で重心を計算
 // 線形振幅の重み: byte(0〜255)は dB を割り当てた値なので、重心・広がりは線形振幅 10^(dBFS/20) で重みづける
-const LIN_AMP = Float64Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255 * DB_SPAN) / 20));
+// byte 0 は「下限(−100 dBFS)に張り付いて測れなかった」ビンなので、重みは 0 にする（デジタル音源の無音部で重心が高域に引っ張られるのを防ぐ）
+const LIN_AMP = Float64Array.from({ length: 256 }, (_, b) => (b === 0 ? 0 : Math.pow(10, (-100 + b / 255 * DB_SPAN) / 20)));
 let centOld = 0;
 let centRel = { c40: 0, c60: 0 };
 function computeCentroidRel(spec, nyq) {
@@ -1471,6 +1472,15 @@ function stamp() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
   return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
 }
+function downloadBlob(name, blob) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
 function downloadText(name, text) {
   const blob = new Blob(['\ufeff' + text], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
@@ -1754,12 +1764,48 @@ function reportSnapshotIfNeeded() {
   save(img, 'wavelab_report_' + stamp() + '.png');
 }
 
+
+// ---- 色譜（楽譜のような時系列画像）と、世界地図用の「音のまとまり」データ ----
+function scoreRecs() { return LOG.rec.filter(r => inRange(r.t)); }
+function scoreMeta() {
+  return { source: (fp && fp.name) || 'マイク/再生', hue_mapping: hueSourceLabel(), flat_range_db: FLAT_RANGE_DB, calibration_db_spl: splOffset,
+    range_s: rangeOn() ? [RANGE.a, RANGE.b] : null };
+}
+function saveCanvasPng() {
+  const recs = scoreRecs();
+  if (recs.length < 5) { toast('記録が少なすぎます。先に音を録ってください'); return; }
+  const m = scoreMeta();
+  const r = WLScore.renderCanvas(recs, { caption: 'WAVE LAB　' + m.source + '　' + (recs[recs.length - 1].t - recs[0].t).toFixed(1) + ' 秒' });
+  r.canvas.toBlob(b => { if (b) { downloadBlob('wavelab_canvas_' + stamp() + '.png', b); toast('色キャンバスを保存しました'); } }, 'image/png');
+}
+function saveScorePng() {
+  const recs = scoreRecs();
+  if (recs.length < 5) { toast('記録が少なすぎます。先に音を録ってください'); return; }
+  const m = scoreMeta();
+  const lines = [new Date().toLocaleString('ja-JP') + '　' + recs.length + ' 点 / ' + (recs[recs.length - 1].t - recs[0].t).toFixed(1) + ' 秒',
+    '音源: ' + m.source + '　色の対応: ' + m.hue_mapping + (m.range_s ? '　範囲: ' + m.range_s[0].toFixed(1) + '〜' + m.range_s[1].toFixed(1) + ' 秒' : '')];
+  const r = WLScore.render(recs, { title: 'WAVE LAB 色譜（カラースコア）', lines });
+  r.canvas.toBlob(b => { if (b) { downloadBlob('wavelab_score_' + stamp() + '.png', b); toast('色譜を保存しました'); } }, 'image/png');
+}
+function saveEventsJson() {
+  const recs = scoreRecs();
+  if (recs.length < 5) { toast('記録が少なすぎます。先に音を録ってください'); return; }
+  let place = '';
+  try { place = window.prompt('この音を録った場所（任意。例: 沖縄・辺野古海岸）', '') || ''; } catch (e) {}
+  const m = scoreMeta(); m.place = place;
+  downloadBlob('wavelab_events_' + stamp() + '.json', new Blob([WLScore.buildEventsJson(recs, m)], { type: 'application/json' }));
+  toast('音のまとまりJSONを保存しました');
+}
+
 function initReportUI() {
   UI_CTX = 'report';
   const defs = [
     ['時系列CSV', '#10ac84', () => downloadText('wavelab_timeseries_' + stamp() + '.csv', buildTimeSeriesCsv())],
     ['スペクトルCSV', '#4a69bd', () => downloadText('wavelab_spectrum_' + stamp() + '.csv', buildSpectrumCsv())],
     ['レポート画像', '#8e44ad', () => { reportSnap = true; }],
+    ['色キャンバス', '#e84393', () => saveCanvasPng()],
+    ['色譜（詳細）', '#e17055', () => saveScorePng()],
+    ['音のまとまりJSON', '#0984e3', () => saveEventsJson()],
     ['記録をリセット', '#778ca3', () => { resetLog(); }]
   ];
   defs.forEach((d, i) => {

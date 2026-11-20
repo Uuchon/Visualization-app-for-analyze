@@ -105,6 +105,9 @@
       <button class="btn" id="bCsvT">時系列CSV</button>
       <button class="btn" id="bCsvS">スペクトルCSV</button>
       <button class="btn" id="bPng">レポート画像</button>
+      <button class="btn" id="bCanvas">色キャンバス</button>
+      <button class="btn" id="bScore">色譜（詳細）</button>
+      <button class="btn" id="bEvJson">音のまとまりJSON</button>
       <button class="btn ghost" id="bReset">記録をリセット</button>
     </div>
     <div class="btns rg"><span class="lbl" style="margin:0">保存範囲</span><input id="rgA" type="number" min="0" step="0.1" placeholder="開始 秒" inputmode="decimal"> 〜 <input id="rgB" type="number" min="0" step="0.1" placeholder="終了 秒" inputmode="decimal"><button class="btn ghost" id="bRgReset">全体に戻す</button></div>
@@ -180,6 +183,7 @@
 </div>
 
 <script src="nr.js"></script>
+<script src="score.js"></script>
 <script src="m.js"></script>
 </body>
 </html>
