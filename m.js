@@ -51,8 +51,31 @@ const P_TBL = Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255
 
 // ---------- 彩度: スペクトル平坦度 ----------
 const FLAT_LO_HZ = 50, FLAT_HI_HZ = 10000, FLAT_TONAL_DB = -45, FLAT_NOISY_DB = -3;
+// 補正重心（比較用）: ピークから R dB 以内のビンだけで、標準と同じ重み(byte値)で重心を計算
+// 線形振幅の重み: byte(0〜255)は dB を割り当てた値なので、重心・広がりは線形振幅 10^(dBFS/20) で重みづける
+const LIN_AMP = Float64Array.from({ length: 256 }, (_, b) => Math.pow(10, (-100 + b / 255 * DB_SPAN) / 20));
+let centOld = 0;
+let centRel = { c40: 0, c60: 0 };
+function computeCentroidRel(spec, nyq) {
+  const len = spec.length;
+  let mx = 0;
+  for (let i = 1; i < len; i++) { if (spec[i] > mx) { mx = spec[i]; } }
+  const out = {};
+  for (const R of [40, 60]) {
+    const thr = Math.max(5, mx - R / DB_SPAN * 255);
+    let wf = 0, tot = 0;
+    for (let i = 1; i < len; i++) {
+      const b = spec[i]; if (b < thr) { continue; }
+      const f = i * nyq / len; if (f < 20 || f > 20000) { continue; }
+      const a = LIN_AMP[b];
+      wf += f * a; tot += a;
+    }
+    out['c' + R] = tot > 0 ? wf / tot : 0;
+  }
+  centRel = out;
+}
 const FLAT_RANGES = [40, 60, 80];                  // 研究用: 比較する補正幅[dB]（CSV には3つとも保存する）
-let FLAT_RANGE_DB = 40;                            // 彩度に使う補正幅。URL に ?flatrange=60 で変更（研究用）
+let FLAT_RANGE_DB = 60;                            // 彩度に使う補正幅（暫定の初期値）。URL に ?flatrange=60 で変更（研究用）
 try { const q = Number(new URLSearchParams(location.search).get('flatrange')); if (FLAT_RANGES.includes(q)) { FLAT_RANGE_DB = q; } } catch (e) {}
 let flatTonalRef = FLAT_TONAL_DB;                  // 彩度100にする平坦度（暫定: 補正幅と帯域ビン数から理論値。混合音実験後に確定）
 let flatSet = { std: 0, c40: 0, c60: 0, c80: 0 };  // 直近フレームの平坦度（標準 / 補正40・60・80 dB）
@@ -573,18 +596,22 @@ function analyze() {
   S.loud = S.domA > 0 ? clamp(phonFromSPL(S.domF, -100 + S.domA * DB_SPAN + splOffset) / PHON_MAX, 0, 1) : 0;
 
   let tot = 0, wf = 0;
+  let wOld = 0, tOld = 0;                          // 旧定義（byte値を重みにしたもの。比較用）
   for (let i = 1; i < len; i++) {
-    const a = sp[i]; if (a < 5) { continue; }
+    const b = sp[i];
     const f = i * nyq / len; if (f < 20 || f > 20000) { continue; }
+    const a = LIN_AMP[b];
     wf += f * a; tot += a;
+    if (b >= 5) { wOld += f * b; tOld += b; }
   }
   S.centroid = tot > 0 ? wf / tot : 0;
+  centOld = tOld > 0 ? wOld / tOld : 0;
+  computeCentroidRel(sp, nyq);
   let variance = 0;
   if (tot > 0) {
     for (let i = 1; i < len; i++) {
-      const a = sp[i]; if (a < 5) { continue; }
       const f = i * nyq / len; if (f < 20 || f > 20000) { continue; }
-      variance += a * (f - S.centroid) * (f - S.centroid);
+      variance += LIN_AMP[sp[i]] * (f - S.centroid) * (f - S.centroid);
     }
   }
   S.spread = tot > 0 ? Math.sqrt(variance / tot) : 0;
@@ -675,7 +702,7 @@ function logFrame() {
   const phonIso = act ? S.loud * PHON_MAX : 0, phonFlat = act ? clamp(spl, 0, PHON_MAX) : 0;
   const hue = (act && S.hueOK) ? S.hue : 0, sat = act ? S.sat : 0, bi = briFromPhon(phonIso), bf = briFromPhon(phonFlat);
   LOG.rec.push({
-    t, src, fpos: src === 'file' ? fpPos() : null, act, dom: S.domF, cen: S.centroid, spr: S.spread, flat: S.flat, fs: flatSet.std, f40: flatSet.c40, f60: flatSet.c60, f80: flatSet.c80,
+    t, src, fpos: src === 'file' ? fpPos() : null, act, dom: S.domF, cen: S.centroid, co: centOld, cc40: centRel.c40, cc60: centRel.c60, spr: S.spread, flat: S.flat, fs: flatSet.std, f40: flatSet.c40, f60: flatSet.c60, f80: flatSet.c80,
     sat, lvl: dbfs, spl, pi: phonIso, pf: phonFlat, hue, bi, bf,
     ci: (act && S.hueOK) ? hsbToRgb(hue, sat, bi) : GRAY, cf: (act && S.hueOK) ? hsbToRgb(hue, sat, bf) : GRAY,
     f0: S.f0ok ? S.f0 : 0, f0c: S.f0ok ? S.f0conf : 0, note: S.f0ok ? S.noteEn : '', cents: S.f0ok ? S.cents : '', mode: HUE.mode,
@@ -709,8 +736,9 @@ function buildTimeSeriesCsv() {
     '# 音声ファイル,' + csvCell(fp.name || 'なし') + ',ノイズ除去の強さ,' + (fp.alphaUsed === null ? '' : Number(fp.alphaUsed).toFixed(2)) + ',雑音推定,' + csvCell(fp.method || ''),
     '# phon_iso = 等ラウドネス曲線(ISO 226)に沿った大きさ / phon_flat = 補正なし(音圧をそのまま大きさとみなす)',
     '# 平坦度: std=標準(下限なし) / corrN=ピークからN dBより下を下限にそろえた値(規格化なし) / used=彩度に使った値(補正幅 '+FLAT_RANGE_DB+' dB, 帯域 '+FLAT_LO_HZ+'-'+FLAT_HI_HZ+' Hz)',
+    '# 重心: centroid_hz=標準(線形振幅の重み。色相に使用) / centroid_bytew_hz=旧定義(dB由来のbyte値を重みにしたもの) / centroid_corrN_hz=ピークからN dB以内のビンだけで計算(比較用)',
     '# 色: 色相=設定した対応(hue_mapping) 彩度=スペクトル平坦度 明度=phon.  hex_iso=補正あり hex_flat=補正なし',
-    ['time_s', 'source', 'file_pos_s', 'active', 'dominant_hz', 'centroid_hz', 'spread_hz', 'flatness_std_db', 'flatness_corr40_db', 'flatness_corr60_db', 'flatness_corr80_db', 'flatness_used_db', 'saturation_pct',
+    ['time_s', 'source', 'file_pos_s', 'active', 'dominant_hz', 'centroid_hz', 'centroid_bytew_hz', 'centroid_corr40_hz', 'centroid_corr60_hz', 'spread_hz', 'flatness_std_db', 'flatness_corr40_db', 'flatness_corr60_db', 'flatness_corr80_db', 'flatness_used_db', 'saturation_pct',
      'level_dbfs', 'spl_db', 'phon_iso', 'phon_flat', 'hue_deg', 'brightness_iso_pct', 'brightness_flat_pct', 'hex_iso', 'hex_flat',
      'f0_hz', 'f0_confidence', 'note', 'cents', 'hue_mapping'].join(',')
   ];
@@ -718,7 +746,7 @@ function buildTimeSeriesCsv() {
     if (!inRange(r.t)) { continue; }
     lines.push([
       r.t.toFixed(3), r.src, r.fpos === null ? '' : r.fpos.toFixed(3), r.act,
-      r.dom.toFixed(1), r.cen.toFixed(1), r.spr.toFixed(1), r.fs.toFixed(2), r.f40.toFixed(2), r.f60.toFixed(2), r.f80.toFixed(2), r.flat.toFixed(2), r.sat.toFixed(1),
+      r.dom.toFixed(1), r.cen.toFixed(1), r.co.toFixed(1), r.cc40.toFixed(1), r.cc60.toFixed(1), r.spr.toFixed(1), r.fs.toFixed(2), r.f40.toFixed(2), r.f60.toFixed(2), r.f80.toFixed(2), r.flat.toFixed(2), r.sat.toFixed(1),
       r.lvl.toFixed(2), r.spl.toFixed(2), r.pi.toFixed(2), r.pf.toFixed(2),
       r.hue.toFixed(1), r.bi.toFixed(1), r.bf.toFixed(1), rgbHex(r.ci), rgbHex(r.cf),
       r.f0.toFixed(1), r.f0c.toFixed(2), r.note, r.cents === '' ? '' : r.cents.toFixed(1), r.mode
